@@ -1,0 +1,40 @@
+{
+  "name": "harness2-codex",
+  "version": "0.2.0+codex.20261022223338",
+  "description": "Real Harness\u00b2 Propose-Probe-Compose optimization for Codex projects with isolated experiments, verification, approval, rollback, and cost ledgers.",
+  "author": {
+    "name": "wzn1118"
+  },
+  "homepage": "https://github.com/wzn1118/harness2-codex",
+  "license": "Apache-2.0",
+  "keywords": [
+    "harness2",
+    "codex",
+    "optimization",
+    "agents",
+    "skills",
+    "mcp",
+    "verification"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Harness\u00b2 for Codex",
+    "shortDescription": "Experimentally optimize Codex harnesses with evidence",
+    "longDescription": "Unofficial local integration using the pinned, unmodified Google Research Harness2 PPC core. Runs independent Codex sessions inside Linux namespace sandboxes; additive AGENTS.md and project Skills edits, bounded tool and execution controls, held-out A/B checks, native user confirmation, signed audit records and drift-safe rollback. API-key-backed Responses provider required; no permission bypass.",
+    "developerName": "wzn1118",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/wzn1118/harness2-codex",
+    "defaultPrompt": [
+      "Run a Harness\u00b2 optimization experiment for this project.",
+      "Show the latest Harness\u00b2 experiment and its cost ledger.",
+      "Apply the verified Harness\u00b2 proposal after I confirm it."
+    ],
+    "brandColor": "#1A73E8"
+  }
+}

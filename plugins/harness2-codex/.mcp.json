@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "harness2-codex": {
+      "command": "python3",
+      "args": ["./scripts/harness2_mcp.py", "--stdio"],
+      "cwd": ".",
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 180,
+      "env_vars": [
+        "CODEX_HOME",
+        "PATH",
+        "HOME",
+        "HARNESS2_STATE_DIR",
+        "DISPLAY",
+        "XAUTHORITY",
+        "WAYLAND_DISPLAY",
+        "XDG_RUNTIME_DIR"
+      ]
+    }
+  }
+}

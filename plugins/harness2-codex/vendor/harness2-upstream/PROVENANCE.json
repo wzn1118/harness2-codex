@@ -1,0 +1,141 @@
+{
+  "repository": "https://github.com/google-research/harness2",
+  "commit": "1cfe254e8d25b15f37048c3730134686abe60335",
+  "files": [
+    {
+      "path": "LICENSE",
+      "git_blob_sha1": "d645695673349e3947e8e5ae42332d0ac3164cd7",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "path": "README.md",
+      "git_blob_sha1": "a5e91206948cd3d5bbed30c2a951923020e780d2",
+      "sha256": "17639ac4194bb5c042cbf645430a772ae9be81baee95ab41eaea73cafa138f23"
+    },
+    {
+      "path": "docs/EXPERIMENTS.md",
+      "git_blob_sha1": "bd52e1506037d172a03c128427881d5342bbace7",
+      "sha256": "ce168deb03d4607c70e00e092701d2f6d5987db04e09779b0e3cad48b7fca558"
+    },
+    {
+      "path": "docs/SETUP.md",
+      "git_blob_sha1": "0d037b8a1482391410cec9b5e9ea2a2ce27b07c8",
+      "sha256": "49cce7fbda4352102feea1e57a01d714118600980abcf2ff853953a65565014a"
+    },
+    {
+      "path": "harness2/__init__.py",
+      "git_blob_sha1": "e2bf767dbe010e23fd18e416ea21f438b1a1fc93",
+      "sha256": "de20a79ef3cf3974bf32cb6afdbb32608655676e749a466ffd6c7c173bb7e26a"
+    },
+    {
+      "path": "harness2/config.py",
+      "git_blob_sha1": "59e0703d11f3904e63c526bb2d7ebaf3ce2bb53d",
+      "sha256": "0db5ba0c42b87f5b14cbff2d11aaecddda1cd45500903c1d61741232bd1e0a88"
+    },
+    {
+      "path": "harness2/core/__init__.py",
+      "git_blob_sha1": "d59d80d5c6ccb02d7d224fce5435fe4d928125c8",
+      "sha256": "ce487673e00fd8921139e3afb688c566fc43d9b07acba048d2102663a81f7151"
+    },
+    {
+      "path": "harness2/core/context.py",
+      "git_blob_sha1": "72f2868b06c13e30c031cb91c0f04dcd80293ec9",
+      "sha256": "63dd482e5d9467d7e659d186a11289fc7861d08c8aed603244ff0cee92de91f3"
+    },
+    {
+      "path": "harness2/core/judge.py",
+      "git_blob_sha1": "cf4e7b9fe2b603421fce6519808deb81bc3ec9c0",
+      "sha256": "0f8cd6f4ec659f5d5976bdad4ccdc432651f51486c3fbbee36be53a6d619fbba"
+    },
+    {
+      "path": "harness2/core/ledger.py",
+      "git_blob_sha1": "319a6697758d05294dab9f42e8f8700759d7e6f6",
+      "sha256": "7059de5d90fc9fb8d4b3b799ff075f09d34f182ba0fdb56eb9d8b8383d0bbf55"
+    },
+    {
+      "path": "harness2/core/library.py",
+      "git_blob_sha1": "39e50684b4044e483a3c16a447958044d4b5e6de",
+      "sha256": "00219fda201a030f43b35b49c4e73ccf336aedc81164144c435b4b06a1256dd3"
+    },
+    {
+      "path": "harness2/core/prompts.py",
+      "git_blob_sha1": "9ccacf23b64ac15b06a1939f26224960f56d757c",
+      "sha256": "d1f4f8db4ab4cb4addcbca175b548db2270375499fda727ac95d271c63cc2504"
+    },
+    {
+      "path": "harness2/core/proposer.py",
+      "git_blob_sha1": "4a235075cae72059fa701001f31bf4505cbbc3ba",
+      "sha256": "475ef49d72228e249d7172d793f8362913774412402dfd259ae6e01c6586e175"
+    },
+    {
+      "path": "harness2/core/recursion.py",
+      "git_blob_sha1": "dda6b98cd5af100b8941f33cbb079462299c5280",
+      "sha256": "b299813b5334f2c0f89024a7f14162f0fdd5418ebd4413be93920b5334a204c1"
+    },
+    {
+      "path": "harness2/core/report.py",
+      "git_blob_sha1": "b7ecf6e42a1061218b0eb8cde9c441c136e28e72",
+      "sha256": "9d5b119ec93dc6b2c6341095130103ab4ba2f2dc6867c4b7ea759fca5de3cac9"
+    },
+    {
+      "path": "harness2/core/runmark.py",
+      "git_blob_sha1": "1de5794b40f043e40ecba66be08a65a5787ebbb1",
+      "sha256": "99a7c3f0b023623224c3376bc0390e985b8e6608f0928d34b821ffe6c36f9175"
+    },
+    {
+      "path": "harness2/core/schedule.py",
+      "git_blob_sha1": "f91f450b1d01011982069f4b41e6e3a77abcc9cc",
+      "sha256": "6e46c5ab1e4ac111818ff3acd6b636e39d650898189ac0c21802a8233ad4cd38"
+    },
+    {
+      "path": "harness2/core/selection.py",
+      "git_blob_sha1": "2cf04f50e35fd82d7abaea279a83b4a7eb4c2193",
+      "sha256": "2cb3353b2fd4ec72e6322f2c1f35db1ff2cdab88b0b50c8809d1841d235cb92f"
+    },
+    {
+      "path": "harness2/core/spec.py",
+      "git_blob_sha1": "e58d14852490b2d4ae3aa6da1c1c796e3e961b48",
+      "sha256": "f245ec9e314778e2a1a51594b906584255b9eed8340c073b864a8a6f2c8dc400"
+    },
+    {
+      "path": "harness2/core/tree.py",
+      "git_blob_sha1": "c9bf1341226aac448f6ec82038cb6d3896799412",
+      "sha256": "c2a15690b1b6b02156e922c5e0b1a215c5065d7bea5a3bae2e56b47309197552"
+    },
+    {
+      "path": "harness2/demo.py",
+      "git_blob_sha1": "487de02d44941754d955ad8a4b0a9e0e6f841db5",
+      "sha256": "8f338b3254922a8a48d66162f7796dde435d3ef65a7ccd441ef604c81a1d39d4"
+    },
+    {
+      "path": "harness2/substrate/__init__.py",
+      "git_blob_sha1": "3fa7f651352570390e081742a555549f74c40c9b",
+      "sha256": "57f95d86cb0d4acfd60fddd52f2d140ffadcf0c318e28093532580339dc3f37d"
+    },
+    {
+      "path": "harness2/substrate/base.py",
+      "git_blob_sha1": "19ef1dac7c07e1788e1a99fbdd1e7b833da44a41",
+      "sha256": "50a63f174e3772888af3882f3ffff3162cefba8d36e927b1a5de343c5806dd16"
+    },
+    {
+      "path": "harness2/substrate/codex.py",
+      "git_blob_sha1": "fd34eacdf4a7b6991ba75e6ed34df5dd87f4e5e0",
+      "sha256": "281a07271ebed72a617a671ced1b9137901aa8f5d1deffb56c706f44c295e416"
+    },
+    {
+      "path": "harness2/substrate/opencode.py",
+      "git_blob_sha1": "ad0a2ea4d59bda362838c76912e43b6f7c333254",
+      "sha256": "dabc79953d164a0d38802125756379ffa6acdc7b553d2f9036475f8220166ff0"
+    },
+    {
+      "path": "pyproject.toml",
+      "git_blob_sha1": "d5892bea7cfd1d2a6d509b057a9cb6a66d6901ae",
+      "sha256": "c78fd0d09d2f92bf796871c168b548dd4d33e21566dbb582e343266e24a0bada"
+    },
+    {
+      "path": "tests/test_workflow.py",
+      "git_blob_sha1": "2b7ebeb1816346f606922816a6f3609c64e8f8cc",
+      "sha256": "fda03aa8d1d4bb1a43b16a96da4a272427969a1a540cc0954709aeed7a03a4aa"
+    }
+  ]
+}
