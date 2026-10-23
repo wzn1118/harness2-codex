@@ -16,9 +16,11 @@ hold-out validation are separately accounted. Parallel mode composes from all
 - Linux with working unprivileged user/mount/network namespaces and `bwrap`.
 - Python 3.10 or newer. The adapter's vendored runtime has no third-party Python dependencies.
 - Installed Codex CLI supporting plugins and its native Linux sandbox.
-- Existing API-key-backed Codex Responses provider. Uses its exact configured
-  model. Real credentials stay in the host-side broker; workers receive only
-  revoked-after-use local proxy tokens. ChatGPT OAuth-only accounts fail closed.
+- Existing API-key-backed Codex Responses provider. Uses the active provider by
+  default; a run may explicitly select another provider already configured in
+  Codex and a model listed in its model catalog. Real credentials stay in the
+  host-side broker; workers receive only revoked-after-use local proxy tokens.
+  ChatGPT OAuth-only accounts fail closed.
 - Tkinter and a graphical desktop for the final native confirmation dialog.
 
 ```bash
@@ -28,6 +30,23 @@ codex plugin add harness2-codex@harness2-local
 
 Start a new chat to load the plugin's Skill and MCP tools. This does not modify
 the Codex executable or UI source. It adds native plugin discovery and MCP tools.
+
+### Provider Selection
+
+`harness2_inspect` and `harness2_run` accept optional `model_provider` and
+`model` fields. The provider must already exist in the host `config.toml`; a
+different model must be listed in its `model_catalog_json`. This selects a
+provider only for that experiment and does not edit Codex configuration. For
+example, after configuring an A6API Responses provider in Codex, a run can use
+`model_provider: "A6API"` and `model: "gpt-6.1-sol"`.
+
+To use a provider key held in a local file, set
+`HARNESS2_PROVIDER_API_KEY_FILE` in the environment used to start Codex. The
+path must be absolute; the file must be owned by the Codex user and have mode
+`0600` or stricter. The plugin reads it in the host-side broker, never copies
+the key into the project or worker home. The MCP manifest explicitly forwards
+this path variable. Do not put key contents in tool arguments, project files,
+or the Codex model catalog.
 
 Chat example:
 
@@ -83,7 +102,8 @@ prevents a clean worker home from silently discarding project restrictions.
 - `harness2_estimate_budget`: preallocates request/output/token ceilings without
   starting provider calls; it is not a dollar quote.
 - `harness2_run`: starts a background experiment; no original project writes.
-- `harness2_status`: progress, behavioral evidence, exact diff, actual usage.
+- `harness2_status`: progress, behavioral evidence, exact diff, provider/model,
+  per-invocation errors and usage completeness.
 - `harness2_get_report`: reads the integrity-checked signed report.
 - `harness2_preview_apply`: checks eligibility and project drift without writes.
 - `harness2_cancel`: cancels and kills isolated process groups.
@@ -102,7 +122,12 @@ secret names, symlinks, dependency caches and build outputs are excluded from
 snapshots; embedded private-key/API-key signatures cause a refusal.
 Worker-created symlinks, hardlinks and nonregular artifacts are rejected before
 host-side evidence or harness readers run, preventing namespace-external link
-targets from being read after an isolated process exits.
+targets from being read after an isolated process exits. Codex `error`,
+`turn.failed` and `response.failed` events are preserved as sanitized worker
+diagnostics with request IDs; they invalidate affected comparisons. The ledger
+separates provider request count from responses with usage and explicitly counts
+missing-usage responses. An absent HTTP status is not inferred from an error
+message.
 
 **No unsandboxed fallback.** No OS services, approvals, execpolicy rules or
 global trust settings are relaxed by the plugin. Native GUI confirmation is

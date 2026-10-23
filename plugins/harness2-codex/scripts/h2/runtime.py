@@ -1,12 +1,14 @@
 """Pinned-model Codex runtime with a credential-hiding Responses proxy."""
 from __future__ import annotations
 import http.server
+import http.client
 import json
 import os
 import re
 import secrets
 import shutil
 import socketserver
+import stat
 import sys
 import tempfile
 import threading
@@ -36,6 +38,100 @@ def _retry_after(headers):
     value = headers.get("Retry-After")
     return value.strip() if isinstance(value, str) and re.fullmatch(r"[0-9]{1,6}", value.strip()) else None
 
+def _catalog_models(config, home):
+    catalog = config.get("model_catalog_json")
+    if not isinstance(catalog, str) or not catalog:
+        return set()
+    path = Path(catalog).expanduser()
+    if not path.is_absolute():
+        path = home / path
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError("Configured model catalog cannot be read") from exc
+    rows = data.get("models", []) if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        raise ValueError("Configured model catalog has an unsupported shape")
+    names = set()
+    for row in rows:
+        if isinstance(row, str):
+            names.add(row)
+        elif isinstance(row, dict):
+            for key in ("slug", "id", "model"):
+                value = row.get(key)
+                if isinstance(value, str) and value:
+                    names.add(value)
+    return names
+
+def _key_file_value(value):
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ValueError("HARNESS2_PROVIDER_API_KEY_FILE must be an absolute path")
+    if path.is_symlink():
+        raise ValueError("Provider key file must not be a symbolic link")
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise RuntimeError("Configured provider key file is unavailable") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("Provider key file must be a regular file")
+    if os.name == "posix":
+        if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+            raise ValueError("Provider key file must be owned by the Codex user")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError("Provider key file permissions must be 0600 or stricter")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError("Configured provider key file is unavailable") from exc
+    if len(raw) > 8192:
+        raise ValueError("Provider key file is unexpectedly large")
+    try:
+        key = raw.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise ValueError("Provider key file must contain UTF-8 text") from exc
+    if not key or "\n" in key or "\r" in key:
+        raise ValueError("Provider key file must contain exactly one nonempty key")
+    return key
+
+def extract_codex_errors(path, secret=""):
+    errors = []
+    seen = set()
+    request_id_pattern = re.compile(r"\brequest[_ ]id\s*[:=]\s*([A-Za-z0-9._:-]{1,128})", re.I)
+    if not Path(path).is_file():
+        return errors
+    with Path(path).open() as stream:
+        for line in stream:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict) or row.get("type") not in {"error", "turn.failed", "response.failed"}:
+                continue
+            payload = row.get("error")
+            payload = payload if isinstance(payload, dict) else row
+            message = payload.get("message")
+            if not isinstance(message, str) or not message.strip():
+                continue
+            message = message.strip()[:2000]
+            if secret:
+                message = message.replace(secret, "[REDACTED]")
+            message = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]", message)
+            request_match = request_id_pattern.search(message)
+            request_id = request_match.group(1) if request_match else None
+            status = payload.get("http_status", payload.get("status_code"))
+            if isinstance(status, str) and status.isdigit():
+                status = int(status)
+            if type(status) is not int or not 100 <= status <= 599:
+                status = None
+            fingerprint = (request_id, message)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            errors.append({"event_type": row["type"], "message": message,
+                           "request_id": request_id, "http_status": status})
+    return errors
+
 class ProviderFailure(RuntimeError):
     def __init__(self, status, host, request_id=None, retry_after=None, *, circuit_open=False, transport=None):
         self.status = status
@@ -43,6 +139,7 @@ class ProviderFailure(RuntimeError):
         self.request_id = request_id
         self.retry_after = retry_after
         self.circuit_open = circuit_open
+        self.transport = transport
         if circuit_open:
             message = f"Provider circuit open after HTTP {status} from {host}"
         elif transport:
@@ -60,9 +157,10 @@ class ProviderFailure(RuntimeError):
     def as_record(self, label):
         return {"label": label, "status": self.status, "provider_host": self.host,
                 "request_id": self.request_id, "retry_after": self.retry_after,
-                "circuit_open": self.circuit_open}
+                "circuit_open": self.circuit_open,
+                "status_origin": "local_transport_mapping" if self.transport else "provider_http"}
 
-def host_config():
+def host_config(model_provider=None, model=None):
     home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
     for path in (home/"requirements.toml",Path("/etc/codex/requirements.toml"),Path("/etc/codex/config.toml"),home/"AGENTS.md",home/"AGENTS.override.md"):
         if path.exists():raise ValueError("Additional host policy/instructions require explicit import; refusing to omit: "+str(path))
@@ -80,20 +178,46 @@ def host_config():
         raise ValueError("Custom sandbox filesystem policies require an explicit adapter; refusing to weaken them")
     if config.get("approval_policy", "on-request") not in ("on-request", "never"):
         raise ValueError("Unsupported approval policy; refusing to substitute a different policy")
-    provider_name = config.get("model_provider", "openai")
-    provider = config.get("model_providers", {}).get(provider_name, {})
-    model = config.get("model")
-    if not model: raise ValueError("Set an explicit model in the existing Codex config; no silent model substitution")
+    provider_name = model_provider or config.get("model_provider", "openai")
+    if not isinstance(provider_name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", provider_name):
+        raise ValueError("model_provider must name a configured Codex provider")
+    provider = config.get("model_providers", {}).get(provider_name)
+    if provider is None and provider_name == "openai":
+        provider = {}
+    if not isinstance(provider, dict):
+        raise ValueError("Requested model_provider is not configured in the host Codex config")
+    configured_model = config.get("model")
+    selected_model = model or configured_model
+    if not isinstance(selected_model, str) or not selected_model:
+        raise ValueError("Set an explicit model in the existing Codex config; no silent model substitution")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}", selected_model):
+        raise ValueError("model must be a valid model-catalog identifier")
+    if model and model != configured_model and model not in _catalog_models(config, home):
+        raise ValueError("Requested model is not present in the configured Codex model catalog")
     auth = json.loads((home / "auth.json").read_text()) if (home / "auth.json").exists() else {}
-    key = os.environ.get(provider.get("env_key", "OPENAI_API_KEY")) or auth.get("OPENAI_API_KEY")
-    if not key: raise RuntimeError("This release requires an API-key-backed Codex Responses provider; ChatGPT OAuth is not copied or silently substituted")
-    base = provider.get("base_url", "https://api.openai.com/v1").rstrip("/")
-    if not base.startswith("https://"): raise ValueError("Upstream provider must use HTTPS")
+    if not isinstance(auth, dict):
+        raise ValueError("Codex auth.json must contain a JSON object")
+    env_key = provider.get("env_key", "OPENAI_API_KEY")
+    if not isinstance(env_key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", env_key):
+        raise ValueError("Configured provider env_key is invalid")
+    key = os.environ.get(env_key) or auth.get(env_key) or os.environ.get("HARNESS2_PROVIDER_API_KEY")
+    if not key and os.environ.get("HARNESS2_PROVIDER_API_KEY_FILE"):
+        key = _key_file_value(os.environ["HARNESS2_PROVIDER_API_KEY_FILE"])
+    if not isinstance(key, str) or not key.strip(): raise RuntimeError("This release requires an API-key-backed Codex Responses provider; ChatGPT OAuth is not copied or silently substituted")
+    base = provider.get("base_url", "https://api.openai.com/v1")
+    if not isinstance(base, str): raise ValueError("Configured provider base_url must be text")
+    base = base.rstrip("/")
+    parsed_base = urllib.parse.urlsplit(base)
+    if parsed_base.scheme != "https" or not parsed_base.hostname or parsed_base.username or parsed_base.password:
+        raise ValueError("Upstream provider must use an HTTPS URL without embedded credentials")
     if provider.get("wire_api", "responses") != "responses": raise ValueError("Only Responses providers are supported")
     sandbox = "read-only" if preset == ":read-only" else config.get("sandbox_mode", "workspace-write")
     features=config.get("features",{})
     envelope={"shell":features.get("shell_tool",True) is not False,"apply_patch":features.get("apply_patch_freeform",True) is not False}
-    return {"model": model, "base_url": base, "key": key, "sandbox_mode": sandbox, "approval_policy": config.get("approval_policy", "on-request"), "codex_home":str(home),"tool_envelope":envelope}
+    return {"model": selected_model, "model_provider": provider_name,
+            "provider_host": parsed_base.hostname, "base_url": base, "key": key,
+            "sandbox_mode": sandbox, "approval_policy": config.get("approval_policy", "on-request"),
+            "codex_home":str(home),"tool_envelope":envelope}
 
 def binary_path():
     executable = Path(shutil.which("codex") or "/not-found").resolve()
@@ -129,6 +253,7 @@ class Runtime:
         self.execution_timeout_sec = execution_timeout_sec
         self.requests, self.output_used = 0, 0
         self.invocations, self.billing = [], []
+        self.worker_errors = []
         self.infrastructure_errors = {}
         self.provider_errors = []
         self.provider_host = urllib.parse.urlsplit(config["base_url"]).hostname or "unknown"
@@ -249,15 +374,17 @@ class Runtime:
                      "Content-Type": "application/json", "Accept": accept},
         )
         record = {"at": stamp(), "label": label, "model": self.config["model"],
+                  "model_provider": self.config.get("model_provider"),
                   "provider_host": self.provider_host, "reserved_output_tokens": reserve}
         with self.lock:
             self.billing.append(record)
         try:
             with urllib.request.urlopen(req, timeout=180) as response:
-                payload = response.read(32_000_000)
-                content_type = response.headers.get("Content-Type", "application/json")
                 record["http_status"] = response.status
                 record["provider_request_id"] = _provider_request_id(response.headers)
+                content_type = response.headers.get("Content-Type", "application/json")
+                payload = response.read(32_000_000)
+                record["response_read_complete"] = True
         except urllib.error.HTTPError as exc:
             record["http_status"] = exc.code
             record["provider_request_id"] = _provider_request_id(exc.headers)
@@ -266,7 +393,7 @@ class Runtime:
                 label, exc.code, record["provider_request_id"], record["retry_after"])
             exc.close()
             raise failure from None
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
             record["transport_error"] = type(exc).__name__
             failure = self._record_provider_failure(
                 label, 503, transport=type(exc).__name__)
@@ -319,14 +446,28 @@ class Runtime:
         with self.lock: self.tokens.pop(token,None)
         last = home / "last.txt"
         text = last.read_text() if last.exists() else ""
+        invocation_events = audit/(label+".jsonl")
+        codex_errors = extract_codex_errors(invocation_events, self.config["key"])
         with self.lock:
             billed=[x for x in self.billing if x.get("label")==label]
+            self.worker_errors.extend({"label":label, **error} for error in codex_errors)
         usage={k:sum(int(x.get("usage",{}).get(k,0)) for x in billed if x.get("usage")) for k in ("input_tokens","output_tokens","total_tokens")}
         usage["responses_with_usage"]=sum(bool(x.get("usage")) for x in billed)
+        usage["provider_requests"]=len(billed)
+        usage["responses_missing_usage"]=len(billed)-usage["responses_with_usage"]
         with self.lock:infrastructure_errors=list(self.infrastructure_errors.get(label,[]))
+        infrastructure_errors.extend(
+            "Codex worker reported " + error["event_type"] + ": " + error["message"]
+            + ("; request_id=" + error["request_id"] if error.get("request_id") else "")
+            for error in codex_errors
+        )
         if result['exit_code'] and not billed and not infrastructure_errors:
             infrastructure_errors.append('Worker launcher failed before any provider request: '+result['stderr'][-1000:])
-        record = {"label":label,"at":stamp(),"model":self.config["model"],"sandbox_mode":sandbox,"approval_policy":approval,"wall_s":result["wall_s"],"exit_code":result["exit_code"],"stop_reason":result["stop_reason"],"stderr":result["stderr"][-5000:],"last_message":text,"events":str(audit/(label+".jsonl")),"known_provider_usage":usage,"infrastructure_errors":infrastructure_errors}
+        elif result["exit_code"] and not usage["responses_with_usage"] and not infrastructure_errors:
+            infrastructure_errors.append(
+                f"Codex worker exited {result['exit_code']} after {len(billed)} provider request(s); usage unavailable"
+            )
+        record = {"label":label,"at":stamp(),"model":self.config["model"],"model_provider":self.config.get("model_provider"),"provider_host":self.provider_host,"sandbox_mode":sandbox,"approval_policy":approval,"wall_s":result["wall_s"],"exit_code":result["exit_code"],"stop_reason":result["stop_reason"],"stderr":result["stderr"][-5000:],"last_message":text,"events":str(invocation_events),"known_provider_usage":usage,"codex_errors":codex_errors,"infrastructure_errors":infrastructure_errors}
         atomic(audit/(label+".json"),record)
         with self.lock: self.invocations.append(record)
         event(self.run,"invocation_finished",label=label,exit_code=result["exit_code"])
@@ -342,11 +483,15 @@ class Runtime:
             invocation_count = len(self.invocations)
             provider_requests = self.requests
             output_reserved = self.output_used
+            worker_errors = [dict(x) for x in self.worker_errors]
         known = [x["usage"] for x in billing if x.get("usage")]
         totals = {key:sum(int(x.get(key,0)) for x in known) for key in ("input_tokens","output_tokens","total_tokens")}
         totals["cached_input_tokens"] = sum(int(x.get("input_tokens_details",{}).get("cached_tokens",0)) for x in known)
         totals.update({"provider_requests":provider_requests,"usage_complete":len(known)==provider_requests,"output_tokens_reserved":output_reserved,"request_budget":self.max_requests,"output_token_budget":self.output_budget,"cost_usd":None,"cost_status":"unknown: no provider pricing supplied"})
+        totals["responses_with_usage"] = len(known)
+        totals["provider_responses_missing_usage"] = max(0, provider_requests-len(known))
         totals["provider_errors"] = provider_errors
+        totals["codex_worker_errors"] = worker_errors
         if self.prices and len(known)==provider_requests:
             totals["cost_usd"] = (totals["input_tokens"]*self.prices["input_per_million"]+totals["output_tokens"]*self.prices["output_per_million"])/1e6
             totals["cost_status"] = "estimate using user-supplied rates; not an invoice"

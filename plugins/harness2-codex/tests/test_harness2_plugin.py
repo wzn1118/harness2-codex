@@ -18,7 +18,7 @@ from h2 import common as C, project as P, guard
 from h2 import server
 from h2.deploy import deploy, rollback
 from h2.engine import ProjectAdapter, verify_pair, summarize_validation
-from h2.runtime import host_config, ProviderFailure, Runtime
+from h2.runtime import host_config, ProviderFailure, Runtime, extract_codex_errors
 from h2.budget import Budget, allocation
 
 class SafetyTests(unittest.TestCase):
@@ -29,6 +29,46 @@ class SafetyTests(unittest.TestCase):
         self.old=C.STATE;C.STATE=self.state;self.addCleanup(setattr,C,'STATE',self.old)
         (self.root/'AGENTS.md').write_text('# Existing\nNever weaken permissions.\n')
     def test_pinned_source_integrity(self):C.verify_upstream()
+    def test_codex_stream_errors_are_deduplicated_and_keep_only_safe_diagnostics(self):
+        events=Path(self.temp.name)/'worker.jsonl'
+        message='stream disconnected before completion; request_id: req-123; token=provider-secret'
+        events.write_text('\n'.join((
+            json.dumps({'type':'error','message':message}),
+            json.dumps({'type':'turn.failed','error':{'message':message}}),
+            json.dumps({'type':'item.completed','message':'not a failure'})
+        ))+'\n')
+        errors=extract_codex_errors(events,'provider-secret')
+        self.assertEqual(len(errors),1)
+        self.assertEqual(errors[0]['request_id'],'req-123')
+        self.assertIsNone(errors[0]['http_status'])
+        self.assertIn('[REDACTED]',errors[0]['message'])
+        self.assertNotIn('provider-secret',json.dumps(errors))
+    def test_a6api_profile_and_restricted_key_file_are_selectable(self):
+        home=Path(self.temp.name)/'codex-profile';home.mkdir()
+        key_file=Path(self.temp.name)/'a6api-key';key_file.write_text('a6api-test-secret\n');key_file.chmod(0o644)
+        catalog=home/'models.json';catalog.write_text(json.dumps({'models':[{'slug':'gpt-6.1-sol'}]}))
+        (home/'config.toml').write_text(
+            'model_provider="OpenAI"\nmodel="default-model"\n'
+            f'model_catalog_json={json.dumps(str(catalog))}\n'
+            'sandbox_mode="workspace-write"\napproval_policy="on-request"\n'
+            '[model_providers.OpenAI]\nbase_url="https://openai.example/v1"\nwire_api="responses"\n'
+            '[model_providers.A6API]\nbase_url="https://api.a6api.com/v1"\nwire_api="responses"\nenv_key="A6API_API_KEY"\n'
+        )
+        (home/'auth.json').write_text(json.dumps({'OPENAI_API_KEY':'openai-only-secret'}))
+        with patch.dict(os.environ,{'CODEX_HOME':str(home),'HARNESS2_PROVIDER_API_KEY_FILE':str(key_file)},clear=True):
+            with self.assertRaisesRegex(ValueError,'permissions must be 0600'):
+                host_config('A6API','gpt-6.1-sol')
+            key_file.chmod(0o600)
+            selected=host_config('A6API','gpt-6.1-sol')
+            self.assertEqual(selected['model_provider'],'A6API')
+            self.assertEqual(selected['model'],'gpt-6.1-sol')
+            self.assertEqual(selected['provider_host'],'api.a6api.com')
+            self.assertEqual(selected['key'],'a6api-test-secret')
+            with self.assertRaisesRegex(ValueError,'model catalog'):
+                host_config('A6API','not-in-catalog')
+        with patch.dict(os.environ,{'CODEX_HOME':str(home)},clear=True):
+            with self.assertRaisesRegex(RuntimeError,'API-key-backed'):
+                host_config('A6API','gpt-6.1-sol')
     def test_effect_benchmark_verifiers_reject_buggy_baseline(self):
         benchmark=Path(__file__).resolve().parents[1]/'evaluation/effect-benchmark'
         verifiers=sorted((benchmark/'verifiers').glob('check_*.py'))
@@ -130,6 +170,58 @@ class SafetyTests(unittest.TestCase):
             self.assertNotIn('never-log-this',json.dumps(ledger))
             self.assertEqual(runtime.budget.ledger()['charged']['optimization']['requests'],1)
         finally:runtime.close()
+    def test_incomplete_provider_stream_is_transport_error_not_upstream_http_status(self):
+        run=self.state/'incomplete-stream';run.mkdir(parents=True)
+        config={'model':'fixture-model','model_provider':'A6API','base_url':'https://api.a6api.com/v1',
+                'key':'never-log-this','sandbox_mode':'read-only','approval_policy':'on-request'}
+        with patch('h2.runtime.binary_path',return_value=Path('/usr/bin/true')):
+            runtime=Runtime(run,threading.Event(),config)
+        class IncompleteResponse:
+            status=200
+            headers={'x-request-id':'stream-req-123','Content-Type':'text/event-stream'}
+            def __enter__(self):return self
+            def __exit__(self,*args):return False
+            def read(self,*args):raise http.client.IncompleteRead(b'data: partial')
+        try:
+            with patch('h2.runtime.urllib.request.urlopen',return_value=IncompleteResponse()):
+                with self.assertRaises(ProviderFailure) as caught:
+                    runtime.forward('roll-stream',{'model':'fixture-model','input':'short probe'},'text/event-stream')
+            self.assertEqual(caught.exception.status,503)
+            self.assertEqual(caught.exception.transport,'IncompleteRead')
+            record=runtime.ledger()['provider_errors'][0]
+            self.assertEqual(record['status_origin'],'local_transport_mapping')
+            self.assertEqual(record['provider_host'],'api.a6api.com')
+            bill=runtime.billing[0]
+            self.assertEqual(bill['http_status'],200)
+            self.assertFalse(bill.get('response_read_complete',False))
+            ledger=runtime.ledger()
+            self.assertEqual(ledger['provider_responses_missing_usage'],1)
+            self.assertFalse(ledger['usage_complete'])
+            self.assertNotIn('never-log-this',json.dumps(ledger))
+        finally:runtime.close()
+    def test_runtime_stream_error_event_reaches_signed_audit_record(self):
+        run=self.state/'worker-stream-error';run.mkdir(parents=True)
+        config={'model':'fixture-model','model_provider':'A6API','base_url':'https://api.a6api.com/v1',
+                'key':'worker-secret','sandbox_mode':'workspace-write','approval_policy':'on-request'}
+        with patch('h2.runtime.binary_path',return_value=Path('/usr/bin/true')):
+            runtime=Runtime(run,threading.Event(),config)
+        message='stream disconnected before completion; request_id: stream-req-456; token=worker-secret'
+        def worker_error(cmd,**kwargs):
+            Path(kwargs['stdout_path']).write_text('\n'.join((
+                json.dumps({'type':'error','message':message}),
+                json.dumps({'type':'turn.failed','error':{'message':message}})
+            ))+'\n')
+            return {'exit_code':1,'wall_s':1.0,'stop_reason':None,'stderr':'','stdout':''}
+        try:
+            with patch('h2.runtime.guard.process',side_effect=worker_error):
+                result=runtime.call(self.root,'fixture','holdout-0-candidate')
+            self.assertEqual(len(result['codex_errors']),1)
+            self.assertIn('stream-req-456',result['infrastructure_errors'][0])
+            self.assertNotIn('worker-secret',json.dumps(result))
+            ledger=runtime.ledger()
+            self.assertEqual(ledger['codex_worker_errors'][0]['request_id'],'stream-req-456')
+            self.assertNotIn('worker-secret',json.dumps(ledger))
+        finally:runtime.close()
     def test_task_diff_excludes_prematerialized_harness(self):
         run=self.state/'clean-deliverable';run.mkdir(parents=True)
         P.snapshot(self.root,run/'snapshot')
@@ -154,6 +246,10 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(summarize_validation(rows,2)['comparison_valid'])
         rows[-1].update(agent_stop_reason=None,agent_exit_code=1,known_provider_usage={'responses_with_usage':0})
         self.assertFalse(summarize_validation(rows,2)['comparison_valid'])
+        rows[-1].update(infrastructure_errors=['Codex worker reported turn.failed: stream disconnected; request_id=req-123'])
+        result=summarize_validation(rows,2)
+        self.assertFalse(result['comparison_valid'])
+        self.assertTrue(any('request_id=req-123' in reason for reason in result['invalidation_reasons']))
     def test_family_bootstrap_only_supports_a_complete_protected_suite(self):
         tasks=[];rows=[]
         for index in range(10):
@@ -378,6 +474,10 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaises(ValueError):server.validate_request({'project_root':str(self.root),'task':'task'})
         with self.assertRaises(ValueError):server.validate_request({'project_root':str(self.root),'task':'task','check_argv':'echo yes'})
         with self.assertRaises(ValueError):server.validate_request({'project_root':str(self.root),'task':'task','check_argv':['/usr/bin/true'],'k':99})
+        selected=server.validate_request({'project_root':str(self.root),'task':'task','check_argv':['/usr/bin/true'],'model_provider':'A6API','model':'gpt-6.1-sol'})
+        self.assertEqual((selected['model_provider'],selected['model']),('A6API','gpt-6.1-sol'))
+        with self.assertRaisesRegex(ValueError,'model_provider'):
+            server.validate_request({'project_root':str(self.root),'task':'task','check_argv':['/usr/bin/true'],'model_provider':'A6API/../../x'})
     def test_request_validates_and_freezes_protected_multitask_suite(self):
         tasks=[]
         for index in range(10):
@@ -431,5 +531,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(len(replies[1]['result']['tools']),9)
         names={tool['name'] for tool in replies[1]['result']['tools']}
         self.assertTrue({'harness2_estimate_budget','harness2_get_report','harness2_preview_apply'}<=names)
+        run_tool=next(tool for tool in replies[1]['result']['tools'] if tool['name']=='harness2_run')
+        self.assertTrue({'model_provider','model'}<=set(run_tool['inputSchema']['properties']))
 
 if __name__=='__main__':unittest.main()

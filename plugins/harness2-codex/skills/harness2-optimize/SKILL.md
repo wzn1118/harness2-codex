@@ -17,7 +17,11 @@ Use the plugin's MCP tools, not a prompt-only reconstruction.
    explain that it estimates tokens/requests, not dollars. Obtain clear user
    approval of the spend before `harness2_run`.
 3. Start with `k=1` and two validation repeats. Preserve the user's exact
-   configured model. Do not weaken project/host policies if a prerequisite fails.
+   configured model unless the user explicitly selects a `model_provider` and
+   `model` from the host Codex config/model catalog. Preflight that pair with
+   `harness2_inspect`; never change the global Codex config or silently fall
+   back to another provider. Do not weaken project/host policies if a
+   prerequisite fails.
    Supply `validation_tasks` as objects with `task_id`, `family`, `task`,
    `check_argv` (argument array, never shell text), and `protected_paths`.
    The protected files are hidden from every model session and restored only in
@@ -32,6 +36,9 @@ Use the plugin's MCP tools, not a prompt-only reconstruction.
    software-verified fact. Unknown USD cost stays unknown. Never turn A/A,
    KEEP_BASE, incomplete data, a passing smoke test or an interval containing
    zero into a positive improvement claim.
+   Inspect `codex_worker_errors`, `provider_responses_missing_usage` and
+   `validation.invalidation_reasons`; preserve request IDs and do not infer an
+   HTTP status that the provider response did not report.
 5. Before discussing application, call `harness2_preview_apply`. Application is
    eligible only after a valid protected multi-family suite supports positive
    lift and no paired regression. Show the diff and evidence. Only if the human

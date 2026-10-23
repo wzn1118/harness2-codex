@@ -8,11 +8,39 @@ Propose–Probe–Compose（PPC）递归实现，不用提示词模拟。实验�
 
 - Linux、Python 3.10+、`bwrap` 和可用的非特权 user/mount/network namespace。
 - 支持插件/MCP 的 Codex CLI，以及 API key-backed Responses provider。
-- 沿用 Codex 当前配置模型。OAuth-only 认证不支持；隔离条件缺失时 fail closed。
+- 默认沿用当前 provider/model；也可在单次运行中选择 `config.toml` 已配置的 provider 和
+  `model_catalog_json` 中存在的模型。OAuth-only 认证不支持；隔离条件缺失时 fail closed。
 - 运行实验不需要图形界面。应用/回滚需要 Tkinter 和原生桌面确认框。
 
 安装后在新 Codex 聊天使用 `$harness2-optimize`。插件不修改 Codex 二进制、全局配置或
 审批设置；worker 沙箱不高于 workspace-write，项目原有只读限制会保留。
+
+如需从本地密钥文件使用另一个 provider，在 Codex 启动环境中设置
+`HARNESS2_PROVIDER_API_KEY_FILE` 为密钥文件的绝对路径。文件必须由当前 Codex 用户拥有，权限
+为 `0600` 或更严格。插件只在宿主 broker 中读取密钥，不会写入 Codex 配置、项目快照、实验
+worker 或工具参数；`.mcp.json` 已允许透传该路径变量。provider 本身仍须由用户预先配置在
+Codex `config.toml` 中，插件不会替用户改全局配置。
+
+例如，Codex 已存在 `[model_providers.A6API]` 且模型目录包含 `gpt-6.1-sol` 时，可在
+`harness2_inspect` 先检查这个组合，再在 `harness2_run` 传入：
+
+```json
+{
+  "model_provider": "A6API",
+  "model": "gpt-6.1-sol"
+}
+```
+
+A6API provider 配置示例（需由用户自行添加到自己的 Codex 配置；插件不会写入）：
+
+```toml
+[model_providers.A6API]
+name = "A6API"
+base_url = "https://api.a6api.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+env_key = "A6API_API_KEY"
+```
 
 ## 2. 先检查测试和预算
 
@@ -85,6 +113,10 @@ held-out 任务，每个任务使用仓库中独立的 verifier 文件。展示 
   `no_candidate_aa_control_only`、`invalid_comparison`。
 - `ledger`：provider 实际 usage、保守预留、完整性和可选 USD 估算。未提供准确单价时美元成本
   保持 unknown；Token 上限不是美元硬上限。
+- `codex_worker_errors` / `invalidation_reasons`：Codex 流错误、已观察到的 request ID，以及
+  对照失效的具体原因。日志没有 HTTP 状态码时会保持未知，不会从错误文本猜测。
+- `provider_responses_missing_usage`：已发出请求但响应未提供可解析 usage 的数量；此时保留保守
+  预留，账单会明确标为不完整。
 
 `KEEP_BASE` 或空 diff 会触发默认 A/A 控制，但这只能给出可靠性信息，不能估计候选效果。少于
 10 个独立任务家族、验证文件未隔离、任一配对缺失、超时、取消、预算或 provider 故障时，不能
@@ -133,5 +165,13 @@ HTTP 502，随后优化资源预留耗尽；签名报告均为无候选、`valid
 当时 provider 的 502 故障令 PPC 无法产出候选，独立 held-out 验证没有启动。离线夹具、连通
 探测和上游单元测试都不能替代这项缺失的实测。
 
-当前源代码测试为插件 32 项、上游原版 5 项；这些是实现与安全测试，不能替代真实项目 PPC/held-out
+2026-10-23 另一次真实 A6API + `gpt-6.1-sol` PPC 完成了候选生成并运行 5 组单任务留出对照，
+基线 `1/5`、候选 `3/5`。报告仍为 `validation_inconclusive`：候选执行中出现 Codex JSONL
+`stream disconnected before completion`，关联 request ID，但没有可确认的 HTTP 状态码；provider
+HTTP 错误账本未记录这类流错误。另有候选轮次退出码异常，usage 不完整。表面 `+40` 个百分点
+不是有效收益结论；单任务家族也不满足确认性效果评估。账本记录约 1,864,342 Token，usage
+不完整，美元成本未知；没有应用任何差异。该观测促成本版补上 Codex worker 流错误审计、usage
+缺失计数和逐项失效原因，并增加单次实验选择已配置 provider/model 的入口。
+
+当前源代码测试为插件 37 项、上游原版 5 项；这些是实现与安全测试，不能替代真实项目 PPC/held-out
 效果评测。更多审计见 [INTEGRATION_AUDIT.md](INTEGRATION_AUDIT.md)。
