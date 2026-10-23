@@ -16,10 +16,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes bubblewrap
+      - name: Allow bubblewrap user namespaces under Ubuntu AppArmor
+        run: |
+          if [[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || printf '0')" == "1" ]]; then
+            sudo apt-get install --yes apparmor-profiles apparmor-utils
+            profile=/etc/apparmor.d/bwrap-userns-restrict
+            if [[ ! -f "$profile" ]]; then
+              sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict "$profile"
+            fi
+            sudo apparmor_parser -r "$profile"
+          fi
       - name: Install test packages and run isolated suites
         working-directory: plugins/harnesspilot
         run: |
           sudo systemd-run --system --pipe --wait --collect --quiet \
+            --uid="$(id -u)" --gid="$(id -g)" \
             --property=Delegate=yes \
             --property=CPUAccounting=yes \
             --property=MemoryAccounting=yes \
