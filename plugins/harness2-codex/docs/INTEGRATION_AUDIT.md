@@ -113,14 +113,26 @@ Validated on 2026-10-22/23:
   unknown). The source project was unchanged and no candidate was applied.
   This finding led to the worker-error audit, missing-usage counters and
   explicit per-row invalidation reasons now covered by tests.
+- After that upgrade, a real `k=1` sequential PPC ran against the bundled
+  10-family, two-repeat effect benchmark using the active `gpt-6.1-sol` route.
+  The first provider request returned HTTP 502; the circuit breaker prevented
+  further provider calls. No candidate was produced, `validation` was null,
+  the diff was empty and the benchmark project remained unchanged. The signed
+  report retained the provider failure and worker request ID. Provider usage
+  was unavailable; the conservative reservation was 41,404 tokens, not
+  provider-reported usage, and USD cost is unknown. The active Codex config did
+  not contain an A6API provider, so this run was not an A6API run. This verifies
+  failure accounting only; it provides no optimization-effect evidence.
 - No experiment diff was applied. USD costs are unknown because provider rates
   were not supplied. Ordinary test success and partial A/A observations do not
   establish Harness² improvement on a project.
 - The older successful/partial model runs used the prior single-task protocol;
   the two multi-family runs failed before candidate selection, while the A6API
   single-task run had an upstream stream failure and an invalid paired
-  comparison. There is therefore no valid measured effect conclusion: neither
-  a positive effect nor a zero/no-effect result has been established.
+  comparison; the latest multi-family run failed at the provider before
+  candidate generation. There is therefore no valid measured effect
+  conclusion: neither a positive effect nor a zero/no-effect result has been
+  established.
 
 These outcomes are intentionally reported as no valid measured improvement.
 Run-specific event logs, absolute project paths, identifiers and private
