@@ -86,8 +86,12 @@ def validate(surface, original, original_files):
     if set(strategy) != set(DEFAULT_STRATEGY) or strategy["reasoning_effort"] not in {"low", "medium", "high"}: raise ValueError("Strategy: reasoning_effort low/medium/high and timeout_sec only")
     if type(strategy["timeout_sec"]) is not int or not 30 <= strategy["timeout_sec"] <= 600: raise ValueError("timeout_sec must be 30..600")
 
-def materialize(base, dest, surface):
+def materialize(base, dest, surface, *, exclude=()):
     shutil.copytree(base, dest)
+    for name in exclude:
+        path = target(dest, name)
+        if path.exists():
+            path.unlink()
     for name in (".codex/config.toml", ".codex/hooks.json", ".mcp.json"):
         path = dest / name
         if path.exists(): path.unlink()

@@ -6,18 +6,33 @@ import threading
 
 def allocation(request):
     repeats = request.get('validation_repeats', 2)
+    validation_tasks = request.get('validation_tasks') or [
+        {'task_id': 'primary'}
+    ]
     limits = {'requests': request.get('max_requests', 160),
               'output': request.get('max_output_tokens', 655360),
               'tokens': request.get('max_total_tokens', 10000000)}
-    slots = 2 * repeats + 4
+    validation_slots = 2 * repeats * len(validation_tasks)
+    slots = validation_slots + 4
     unit = {key: value // slots for key, value in limits.items()}
     plan = {'reflection': dict(unit)}
-    for trial in range(repeats):
-        for arm in ('baseline', 'candidate'):
-            plan[f'holdout-{trial}-{arm}'] = dict(unit)
-    plan['optimization'] = {key: value - unit[key] * (2 * repeats + 1)
+    for task in validation_tasks:
+        for trial in range(repeats):
+            for arm in ('baseline', 'candidate'):
+                label = (f"holdout-{trial}-{arm}" if len(validation_tasks)==1 and task['task_id']=='primary'
+                         else f"holdout-{task['task_id']}-{trial}-{arm}")
+                plan[label] = dict(unit)
+    plan['optimization'] = {key: value - unit[key] * (validation_slots + 1)
                             for key, value in limits.items()}
     return limits, plan
+
+
+def minimum_session_budget_ok(plan):
+    validation=[values for label,values in plan.items() if label.startswith('holdout-')]
+    if not validation:
+        return False
+    return all(row['requests']>=4 and row['output']>=16384 and row['tokens']>=100000
+               for row in validation)
 
 
 class Budget:

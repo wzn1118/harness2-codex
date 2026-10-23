@@ -31,6 +31,28 @@ def write_file(target,data,mode=None):
     finally:
         if os.path.exists(tmp):os.unlink(tmp)
 
+def preview(run_id):
+    run=C.runpath(run_id)
+    if (run/"audit-invalidation.json").exists():
+        invalidation=C.unseal(C.read(run/"audit-invalidation.json"))
+        return {"run_id":run_id,"eligible":False,"reason":"independent audit invalidated this run","audit_invalidation":invalidation}
+    payload=C.unseal(C.read(run/"deployment.json"));report=payload["report"]
+    validation=report.get("validation") or {}
+    root=Path(report["project_root"])
+    drift=P.tree_hash(root)!=payload["snapshot_manifest"]
+    issues=[]
+    if report.get("status")!="awaiting_confirmation":issues.append("run is not awaiting confirmation")
+    if report.get("ppc_infrastructure_failures"):issues.append("PPC had provider or worker infrastructure failures")
+    if validation.get("comparison_valid") is not True:issues.append("paired comparison is incomplete or invalid")
+    if validation.get("effect_conclusion")!="improvement_supported":issues.append("held-out family-bootstrap interval does not support an improvement")
+    if validation.get("non_regression") is not True:issues.append("candidate does not satisfy the non-regression gate")
+    if not validation.get("confirmatory_suite"):issues.append("confirmatory held-out suite is missing")
+    if drift:issues.append("project snapshot drift detected; rerun before applying")
+    selected=payload.get("selected_surface")
+    if isinstance(selected,dict):P.validate(selected,P.load_surface(run/"snapshot"),P.scan(run/"snapshot"))
+    else:issues.append("no selected candidate surface exists")
+    return {"run_id":run_id,"eligible":not issues,"issues":issues,"project_root":str(root),"changed_files":report.get("changed_files",[]),"diff":report.get("diff",""),"validation":validation,"project_drift":drift,"writes_performed":False,"confirmation_opened":False}
+
 def deploy(run_id, token, *, approve=native_confirm):
     run=C.runpath(run_id)
     lockfile=run/"deployment.lock"
@@ -41,15 +63,18 @@ def deploy(run_id, token, *, approve=native_confirm):
             raise ValueError("Run invalidated by independent audit: "+invalidation["reason"])
         payload=C.unseal(C.read(run/"deployment.json"));report=payload["report"]
         if report["status"]!="awaiting_confirmation":raise ValueError("Run is not awaiting confirmation")
+        if report.get("ppc_infrastructure_failures"):raise ValueError("PPC infrastructure failures invalidate the candidate")
+        root=Path(report["project_root"])
+        if P.tree_hash(root)!=payload["snapshot_manifest"]:raise ValueError("Project drift detected since experiment; rerun instead of overwriting changes")
         if not report.get("validation",{}).get("non_regression"):
             raise ValueError("Independent non-regression validation is required before application")
         if report["validation"].get("comparison_valid") is not True:
             raise ValueError("Valid, resource-unconfounded paired comparison required; older runs must be repeated")
+        if report["validation"].get("effect_conclusion")!="improvement_supported" or report["validation"].get("confirmatory_suite") is not True:
+            raise ValueError("A statistically supported improvement on a protected multi-family hold-out suite is required before application")
         if not token or not secrets_equal(token,report["confirmation_token"]):raise ValueError("Invalid confirmation token")
-        root=Path(report["project_root"])
         changes=C.decode_tree(payload["changes"]);before=C.decode_tree(payload["before"])
         P.validate(payload["selected_surface"],P.load_surface(run/"snapshot"),P.scan(run/"snapshot"))
-        if P.tree_hash(root)!=payload["snapshot_manifest"]:raise ValueError("Project drift detected since experiment; rerun instead of overwriting changes")
         summary="Project: "+str(root)+"\nRun: "+run_id+"\nFiles: "+", ".join(changes)+"\nIndependent validation: "+json.dumps(report["validation"])+"\n\nApply only the reviewed additive harness changes? A backup and rollback record will be retained."
         if not approve("Harness2: apply verified harness",summary):return {"status":"confirmation_declined","run_id":run_id}
         if P.tree_hash(root)!=payload["snapshot_manifest"]:raise ValueError("Project changed during confirmation; nothing applied")

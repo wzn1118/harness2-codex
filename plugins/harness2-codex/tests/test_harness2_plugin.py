@@ -24,6 +24,17 @@ class SafetyTests(unittest.TestCase):
         self.old=C.STATE;C.STATE=self.state;self.addCleanup(setattr,C,'STATE',self.old)
         (self.root/'AGENTS.md').write_text('# Existing\nNever weaken permissions.\n')
     def test_pinned_source_integrity(self):C.verify_upstream()
+    def test_effect_benchmark_verifiers_reject_buggy_baseline(self):
+        benchmark=Path(__file__).resolve().parents[1]/'evaluation/effect-benchmark'
+        verifiers=sorted((benchmark/'verifiers').glob('check_*.py'))
+        self.assertEqual(len(verifiers),10)
+        for verifier in verifiers:
+            result=subprocess.run([sys.executable,str(verifier)],cwd=benchmark,
+                                  capture_output=True,text=True,timeout=10,
+                                  env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1'})
+            self.assertNotEqual(result.returncode,0,verifier.name+' unexpectedly accepts baseline')
+            self.assertNotIn('ModuleNotFoundError',result.stderr,verifier.name)
+            self.assertNotIn('No such file or directory',result.stderr,verifier.name)
     def test_validation_quotas_are_equal_and_cannot_be_stolen(self):
         limits,plan=allocation({'max_requests':560,'max_output_tokens':2293760,'max_total_tokens':50000000,'validation_repeats':5})
         budget=Budget(limits,plan)
@@ -82,6 +93,20 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(summarize_validation(rows,2)['comparison_valid'])
         rows[-1].update(agent_stop_reason=None,agent_exit_code=1,known_provider_usage={'responses_with_usage':0})
         self.assertFalse(summarize_validation(rows,2)['comparison_valid'])
+    def test_family_bootstrap_only_supports_a_complete_protected_suite(self):
+        tasks=[];rows=[]
+        for index in range(10):
+            task={'task_id':f'task-{index}','family':f'family-{index}','protected_paths':[f'tests/test_{index}.py']}
+            tasks.append(task)
+            for trial in range(2):
+                for kind,passed in (('baseline',False),('candidate',True)):
+                    rows.append({'task_id':task['task_id'],'family':task['family'],'trial':trial,'kind':kind,'passed':passed,'check':{'stop_reason':None}})
+        result=summarize_validation(rows,2,tasks)
+        self.assertTrue(result['comparison_valid']);self.assertTrue(result['confirmatory_suite'])
+        self.assertEqual(result['effect_conclusion'],'improvement_supported')
+        self.assertEqual(result['success_lift_95_ci']['lower'],1.0)
+        self.assertTrue(result['non_regression'])
+        self.assertEqual(summarize_validation(rows[:-1],2,tasks)['effect_conclusion'],'invalid_comparison')
     def test_audit_invalidation_blocks_human_approved_deploy(self):
         run_id,run=self.make_deployment()
         C.atomic(run/'audit-invalidation.json',C.seal({'reason':'budget confound','validation':{'comparison_valid':False}}))
@@ -117,6 +142,27 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(result['non_regression']);self.assertFalse(result['measured_success_gain'])
         events=[json.loads(x) for x in (run/'events.jsonl').read_text().splitlines()]
         self.assertTrue(all(e['kind']=='holdout_check' for e in events))
+    def test_holdout_verifier_files_are_hidden_until_judge(self):
+        run=self.state/'private-holdout';run.mkdir(parents=True)
+        tests=self.root/'tests';tests.mkdir();judge_file=tests/'test_private.py';judge_file.write_text('assert True\n')
+        P.snapshot(self.root,run/'snapshot')
+        observations=[]
+        class FakeRuntime:
+            config={'model':'deterministic-test-only'}
+            def call(self,work,*args,**kwargs):
+                observations.append((work/'tests/test_private.py').exists())
+                return {'exit_code':0}
+        adapter=ProjectAdapter(run,run/'snapshot','training task',FakeRuntime(),['tests/test_private.py'])
+        task={'task_id':'heldout','family':'example','task':'different task','check_argv':['/usr/bin/true'],'protected_paths':['tests/test_private.py']}
+        checked=[]
+        def judge(work,*args,**kwargs):
+            checked.append((work/'tests/test_private.py').read_text())
+            return {'exit_code':0,'wall_s':0,'stop_reason':None}
+        with patch('h2.engine.guard.check_command',side_effect=judge):
+            result=verify_pair(adapter,adapter.original,{'validation_tasks':[task],'validation_repeats':2},threading.Event())
+        self.assertEqual(observations,[False]*4)
+        self.assertEqual(checked,['assert True\n']*4)
+        self.assertEqual(result['effect_conclusion'],'no_candidate_aa_control_only')
     def test_unsupported_permission_profiles_fail_closed(self):
         home=Path(self.temp.name)/'codex';home.mkdir()
         with patch.dict(os.environ,{'CODEX_HOME':str(home)}):
@@ -173,13 +219,46 @@ class SafetyTests(unittest.TestCase):
             request={'project_root':str(self.root),'task':'integration fixture','mode':mode,'k':2,'check_argv':['/usr/bin/true']}
             with patch('h2.engine.Runtime',TestRuntime),patch('h2.engine.host_config',return_value={'model':'test-only'}):
                 report=engine.experiment(run,request,threading.Event())
-            self.assertEqual(report['status'],'awaiting_confirmation')
+            self.assertEqual(report['status'],'validation_no_supported_improvement')
             self.assertEqual((report['method']['ledger']['R'],report['method']['ledger']['P']),(8,6))
             self.assertEqual(len(report['validation']['rows']),4)
             self.assertTrue(report['validation']['non_regression'])
             self.assertFalse(report['validation']['measured_success_gain'])
+            self.assertEqual(report['validation']['effect_conclusion'],'insufficient_independent_holdout_families')
+            self.assertIsNone(report['confirmation_token'])
             self.assertEqual(C.unseal(C.read(run/'report.json'))['run_id'],run.name)
             self.assertEqual((self.root/'AGENTS.md').read_bytes(),original)
+    def test_ppc_infrastructure_failure_makes_selected_candidate_inconclusive(self):
+        from h2 import engine
+        class FaultRuntime:
+            def __init__(self,run,cancel,config,**kwargs):
+                self.run,self.config,self.calls=run,config,[]
+                self.invocations=[]
+            def call(self,work,mission,label,**kwargs):
+                self.calls.append(label)
+                if label.startswith('improve-select.'):
+                    text='<why>integration fixture</why>\n```choice\nA\n```'
+                elif label.startswith('improve-experience.'):
+                    text='NO_ENTRY'
+                elif label.startswith('improve-'):
+                    path=work/'context/harness/AGENTS.md'
+                    with path.open('a') as f:f.write('Extra integration fixture guidance.\n')
+                    text='<notes>Fixture guidance.</notes>'
+                    self.invocations.append({'label':label,'infrastructure_errors':['simulated provider failure'],'stop_reason':None})
+                else:text='Test-only execution completed.'
+                events=self.run/(label+'.jsonl');events.write_text('')
+                return {'exit_code':0,'last_message':text,'stderr':'','wall_s':0,'events':str(events)}
+            def ledger(self):return {'test_only':True,'invocations':len(self.calls)}
+            def close(self):pass
+        run=self.state/'20261022T170000-123456789abc';run.mkdir(parents=True)
+        request={'project_root':str(self.root),'task':'integration fixture','k':1,'check_argv':['/usr/bin/true']}
+        with patch('h2.engine.Runtime',FaultRuntime),patch('h2.engine.host_config',return_value={'model':'test-only'}):
+            report=engine.experiment(run,request,threading.Event())
+        self.assertEqual(report['status'],'optimization_inconclusive')
+        self.assertTrue(report['run_outcome'].startswith('ppc_infrastructure_failure_'))
+        self.assertTrue(report['ppc_infrastructure_failures'])
+        self.assertIsNone(report['validation'])
+        self.assertIsNone(report['confirmation_token'])
     def test_real_namespace_denies_host_write_read_and_network(self):
         guard.available()
         outside=Path(self.temp.name)/'protected.txt';outside.write_text('host-private')
@@ -208,7 +287,7 @@ class SafetyTests(unittest.TestCase):
         selected={**original,'AGENTS.md':original['AGENTS.md']+'Run existing tests.\n'}
         changes={'AGENTS.md':selected['AGENTS.md'].encode()};before={'AGENTS.md':(self.root/'AGENTS.md').read_bytes()}
         P.snapshot(self.root,run/'snapshot')
-        report={'status':'awaiting_confirmation','project_root':str(self.root),'confirmation_token':'user-token','validation':{'non_regression':True,'comparison_valid':True},'selection':{'why':'observed','chosen_label':'agg1'}}
+        report={'status':'awaiting_confirmation','project_root':str(self.root),'confirmation_token':'user-token','validation':{'non_regression':True,'comparison_valid':True,'effect_conclusion':'improvement_supported','confirmatory_suite':True},'selection':{'why':'observed','chosen_label':'agg1'}}
         payload={'report':report,'snapshot_manifest':manifest,'selected_surface':selected,'changes':C.encode_tree(changes),'before':C.encode_tree(before),'experience':{},'mode':'agg'}
         C.atomic(run/'deployment.json',C.seal(payload));C.atomic(run/'report.json',C.seal(report))
         return run_id,run
@@ -238,6 +317,49 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaises(ValueError):server.validate_request({'project_root':str(self.root),'task':'task'})
         with self.assertRaises(ValueError):server.validate_request({'project_root':str(self.root),'task':'task','check_argv':'echo yes'})
         with self.assertRaises(ValueError):server.validate_request({'project_root':str(self.root),'task':'task','check_argv':['/usr/bin/true'],'k':99})
+    def test_request_validates_and_freezes_protected_multitask_suite(self):
+        tasks=[]
+        for index in range(10):
+            path=f'verifiers/check_{index}.py';target=self.root/path;target.parent.mkdir(exist_ok=True)
+            target.write_text('assert True\n')
+            tasks.append({'task_id':f'task-{index}','family':f'family-{index}','task':f'Independent holdout task {index}','check_argv':['/usr/bin/python3',path],'protected_paths':[path]})
+        request=server.validate_request({'project_root':str(self.root),'task':'train task','validation_tasks':tasks})
+        self.assertEqual(len(request['private_paths']),10)
+        self.assertTrue(request['validate_unchanged'])
+        tasks[1]['protected_paths']=[tasks[0]['protected_paths'][0]]
+        with self.assertRaisesRegex(ValueError,'task-specific and disjoint'):
+            server.validate_request({'project_root':str(self.root),'task':'train task','validation_tasks':tasks})
+    def test_estimate_tool_exposes_preallocated_multi_family_envelopes(self):
+        result=server.call('harness2_estimate_budget',{'validation_task_count':5,'validation_repeats':2})
+        self.assertEqual(result['validation_task_count'],5)
+        self.assertEqual(result['per_task_arm_envelope']['requests'],6)
+        self.assertIn('token ceilings are not dollar ceilings',result['cost_usd'])
+        larger=server.call('harness2_estimate_budget',{'validation_task_count':10,'validation_repeats':2})
+        self.assertFalse(larger['budget_adequate_for_minimum_session_envelope'])
+    def test_apply_preview_is_read_only_and_checks_evidence_gate(self):
+        from h2.deploy import preview
+        run_id,run=self.make_deployment()
+        before=(self.root/'AGENTS.md').read_bytes()
+        result=preview(run_id)
+        self.assertTrue(result['eligible'])
+        self.assertFalse(result['writes_performed']);self.assertFalse(result['confirmation_opened'])
+        self.assertEqual((self.root/'AGENTS.md').read_bytes(),before)
+        (self.root/'new.py').write_text('changed')
+        result=preview(run_id)
+        self.assertFalse(result['eligible']);self.assertTrue(result['project_drift'])
+    def test_ppc_infrastructure_failure_blocks_preview_and_apply(self):
+        from h2.deploy import preview
+        run_id,run=self.make_deployment()
+        payload=C.unseal(C.read(run/'deployment.json'))
+        report=payload['report']
+        report['ppc_infrastructure_failures']=[{'label':'improve-agg1','error_count':1,'stop_reason':None}]
+        payload['report']=report
+        C.atomic(run/'deployment.json',C.seal(payload));C.atomic(run/'report.json',C.seal(report))
+        result=preview(run_id)
+        self.assertFalse(result['eligible'])
+        self.assertTrue(any('infrastructure failures' in issue for issue in result['issues']))
+        with self.assertRaisesRegex(ValueError,'PPC infrastructure failures'):
+            deploy(run_id,'user-token',approve=lambda *a:True)
     def test_stdio_tools_and_protocol_clean(self):
         entry=Path(__file__).resolve().parents[1]/'scripts/harness2_mcp.py'
         messages=[{'jsonrpc':'2.0','id':1,'method':'initialize','params':{'protocolVersion':'2025-03-26'}},{'jsonrpc':'2.0','id':2,'method':'tools/list'}]
@@ -245,6 +367,8 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         replies=[json.loads(line) for line in result.stdout.splitlines()];self.assertEqual(len(replies),2)
         self.assertEqual(replies[0]['result']['protocolVersion'],'2025-03-26')
-        self.assertEqual(len(replies[1]['result']['tools']),6)
+        self.assertEqual(len(replies[1]['result']['tools']),9)
+        names={tool['name'] for tool in replies[1]['result']['tools']}
+        self.assertTrue({'harness2_estimate_budget','harness2_get_report','harness2_preview_apply'}<=names)
 
 if __name__=='__main__':unittest.main()

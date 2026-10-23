@@ -1,7 +1,7 @@
 {
   "name": "harness2-codex",
-  "version": "0.2.0+codex.20261022223338",
-  "description": "Real Harness\u00b2 Propose-Probe-Compose optimization for Codex projects with isolated experiments, verification, approval, rollback, and cost ledgers.",
+  "version": "0.2.0+codex.20261023000801",
+  "description": "Real Harness\u00b2 Propose-Probe-Compose optimization for Codex with protected multi-task evaluation, family-bootstrap evidence, isolation, human-gated apply, rollback, and cost ledgers.",
   "author": {
     "name": "wzn1118"
   },
@@ -20,8 +20,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Harness\u00b2 for Codex",
-    "shortDescription": "Experimentally optimize Codex harnesses with evidence",
-    "longDescription": "Unofficial local integration using the pinned, unmodified Google Research Harness2 PPC core. Runs independent Codex sessions inside Linux namespace sandboxes; additive AGENTS.md and project Skills edits, bounded tool and execution controls, held-out A/B checks, native user confirmation, signed audit records and drift-safe rollback. API-key-backed Responses provider required; no permission bypass.",
+    "shortDescription": "Optimize Codex harnesses with protected evidence",
+    "longDescription": "Unofficial local integration using the pinned, unmodified Google Research Harness2 PPC core. Runs independent Codex sessions inside Linux namespace sandboxes; additive AGENTS.md and project Skills edits, bounded tool and execution controls, protected multi-task holdouts with family-cluster bootstrap, native user confirmation, signed audit records and drift-safe rollback. API-key-backed Responses provider required; no permission bypass.",
     "developerName": "wzn1118",
     "category": "Developer Tools",
     "capabilities": [

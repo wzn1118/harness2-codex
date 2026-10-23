@@ -1,0 +1,32 @@
+name: Harness2 Codex tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install namespace test dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+      - name: Verify pinned upstream and plugin safety suite
+        working-directory: plugins/harness2-codex
+        run: |
+          PYTHONPATH=scripts python3 -c 'from h2.common import verify_upstream; verify_upstream()'
+          python3 -m unittest discover -s tests -v
+      - name: Run unmodified Harness2 upstream tests
+        working-directory: plugins/harness2-codex
+        run: PYTHONPATH=vendor/harness2-upstream python3 -m unittest discover -s vendor/harness2-upstream/tests -v
+      - name: Run Docker-free deterministic testkit
+        working-directory: plugins/harness2-codex
+        run: |
+          python3 evaluation/no-docker-testkit/testkit.py preflight
+          python3 evaluation/no-docker-testkit/testkit.py offline
+          python3 evaluation/no-docker-testkit/testkit.py ab --tasks discount,slug --repeats 1

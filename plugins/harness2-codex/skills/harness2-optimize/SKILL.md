@@ -7,31 +7,37 @@ description: Run real pinned Google Harness2 Propose-Probe-Compose experiments o
 
 Use the plugin's MCP tools, not a prompt-only reconstruction.
 
-1. Call `harness2_inspect` with the exact absolute project root. Inspect existing
-   tests and agree a trusted `check_argv` before a paid experiment. The root must
-   be a specific project, not `/data` or another mixed collection of projects.
-2. Call `harness2_run` with the task and check argument array. Start with `k=1`,
-   two validation repeats, conservative request/output-token budgets. Preserve
-   the user's exact configured model. Do not weaken the project or host policy
-   when a prerequisite fails; report the failure.
-   `max_total_tokens` includes provider input and output tokens (default 10M,
-   maximum 50M). Validation sessions receive equal, nontransferable request,
-   output and total-token envelopes before optimization starts. Unknown usage
-   retains a conservative reservation. Inspect `resource_envelopes` in costs.
-   An optional common `execution_timeout_sec` (30..600) overrides session
-   timeout for every arm; disclose that timeout-strategy optimization is then
-   not evaluated. It does not change filesystem/network/approval permissions.
-   When the user requests full validation even if PPC keeps the base, set
-   `validate_unchanged=true`. Such checks are a reliability control, not an
-   improvement experiment; they never create an application token.
-3. Poll `harness2_status` for actual progress. Report the upstream R/P ledger,
-   baseline/candidate pass contrast, independent validation, exact changed files,
-   and actual token usage. Unknown dollar costs stay unknown. Equal test passes
-   are non-regression, not demonstrated improvement. Do not claim unrun checks.
-4. Present the verified diff and confirmation token. Only when the human asks
-   to apply, call `harness2_apply`. The native OS dialog is the authoritative
-   final gate; do not click it using automation or bypass it.
-5. Use `harness2_rollback` only when the user requests undo; it also requires
+1. Call `harness2_inspect` with the exact absolute project root. Review the
+   project and its trusted tests. Never choose a mixed parent such as `/data`.
+2. Before provider calls, agree with the user on the optimization task, held-out
+   prompts, verifier commands and budget. For an effect claim, prepare at least
+   10 caller-declared task families, each with its own protected verifier file.
+   Check that families are not paraphrases or from the same underlying issue.
+   Call `harness2_estimate_budget` with task count, repeats and resource ceilings;
+   explain that it estimates tokens/requests, not dollars. Obtain clear user
+   approval of the spend before `harness2_run`.
+3. Start with `k=1` and two validation repeats. Preserve the user's exact
+   configured model. Do not weaken project/host policies if a prerequisite fails.
+   Supply `validation_tasks` as objects with `task_id`, `family`, `task`,
+   `check_argv` (argument array, never shell text), and `protected_paths`.
+   The protected files are hidden from every model session and restored only in
+   the isolated judge workspace. Confirm task prompts are distinct from the PPC
+   optimization task. Validation resources are preallocated per task/arm and
+   cannot be borrowed. `max_total_tokens` includes input and output (default
+   10M, maximum 50M); missing usage retains its conservative reservation.
+4. Poll `harness2_status`, then call `harness2_get_report` for the signed final
+   report. Report the real upstream R/P ledger, per-task and per-family results,
+   bootstrap interval, conclusion class, exact diff, project unchanged status,
+   and actual usage. Caller-declared family independence is an assumption, not
+   software-verified fact. Unknown USD cost stays unknown. Never turn A/A,
+   KEEP_BASE, incomplete data, a passing smoke test or an interval containing
+   zero into a positive improvement claim.
+5. Before discussing application, call `harness2_preview_apply`. Application is
+   eligible only after a valid protected multi-family suite supports positive
+   lift and no paired regression. Show the diff and evidence. Only if the human
+   then asks to apply call `harness2_apply`; the native OS dialog is the final
+   gate. Do not automate or bypass it.
+6. Use `harness2_rollback` only when the user requests undo; it also requires
    the native dialog. Explain stale-file refusals instead of overriding them.
 
 All candidate runs use the unmodified upstream PPC engine in OS-isolated
@@ -41,3 +47,10 @@ optimized. Arbitrary MCP commands, global settings, hooks, permission policies
 and nested AGENTS.md are not modified. User execpolicy rules are preserved.
 Do not hand-edit the original harness or the signed experiment state to get
 around failed validation, drift checks or human confirmation.
+
+If PPC returns KEEP_BASE, the default A/A control may characterize reliability,
+but there is no candidate-effect estimate. If the comparison is incomplete,
+report it as invalid and do not present it as a valid optimization result. The
+system cannot guarantee that a model run will produce a candidate or a positive
+effect; never force one by changing the judge, retrying selectively, or editing
+the signed record.

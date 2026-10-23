@@ -34,22 +34,19 @@ Chat example:
 > 用 Harness² 优化这个项目，先做 k=1 的真实实验。任务是修复当前测试失败，
 > 独立验证使用 `/usr/bin/python3 -m unittest discover -s tests`。
 
-The chat must supply the **explicit absolute project path**, task, and a trusted
-existing `check_argv` array. Tests are never supplied to the improver as results;
-hold-out checks run in fresh network-disabled namespaces after frozen test
-contents are restored. Two paired trials in alternating order are required by
-default. A candidate must pass all checks and not regress baseline pass count.
-Set `validate_unchanged=true` for full reliability checks even when composition
-returns KEEP_BASE; no-change outcomes never receive an application token.
-Equal passes are **not claimed as improvement**; `measured_success_gain` says
-whether actual correctness success improved. Domain-specific checks determine
-what is measured; this is not a proof of general model quality improvement.
-Provider/budget errors, cancellations and timeouts make the paired comparison
-inconclusive, never a correctness gain. Adoption requires an explicitly valid
-comparison; signed audit invalidations block application even if an earlier
-raw report incorrectly marked a run eligible. Validation budgets are now
-preallocated equally per session and cannot be consumed by optimization or
-the other arm; exhaustion within a session still invalidates the comparison.
+The chat must supply the **explicit absolute project path**, optimization task,
+and either a legacy `check_argv` or a multi-task `validation_tasks` suite. For
+effect claims, use at least 10 caller-declared task families with distinct,
+protected verifier files. Verifier files are withheld from every model session
+and restored only for the independent check. Two paired trials in alternating
+order are required by default. A report includes per-task outcomes, a
+deterministic family-cluster bootstrap 95% interval and a conclusion class.
+Family independence is caller-declared and must be reviewed; the software cannot
+infer domain-level relatedness. A candidate must pass every candidate check and
+not regress any paired baseline result. Only a complete protected suite with a
+positive interval can become eligible for application. A/A, KEEP_BASE, one-task
+tests, incomplete comparisons and intervals crossing zero are never reported as
+an optimization gain or issued an application token.
 
 ## Actual Editable Surfaces
 
@@ -83,8 +80,12 @@ prevents a clean worker home from silently discarding project restrictions.
 ## Tools and Safety Gates
 
 - `harness2_inspect`: read-only inventory and prerequisite check.
+- `harness2_estimate_budget`: preallocates request/output/token ceilings without
+  starting provider calls; it is not a dollar quote.
 - `harness2_run`: starts a background experiment; no original project writes.
 - `harness2_status`: progress, behavioral evidence, exact diff, actual usage.
+- `harness2_get_report`: reads the integrity-checked signed report.
+- `harness2_preview_apply`: checks eligibility and project drift without writes.
 - `harness2_cancel`: cancels and kills isolated process groups.
 - `harness2_apply`: requires reviewed run token **and a native human GUI click**.
   A model-supplied boolean/string cannot bypass the dialog. Full snapshot hash
@@ -112,11 +113,11 @@ unavailable on headless hosts, so those hosts may experiment but cannot apply.
 Each run has maximum provider-request, output-reservation and total-token
 envelopes, enforced before dispatch (including concurrent requests). The
 defaults are 160 requests, 655360 reserved output tokens and 10M total tokens;
-the supported total-token maximum is 50M. With `n` validation
-pairs, resources are split into `2n+4` units: one immutable unit per validation
-session, one for reflection, and three for optimization. Remainders stay with
-optimization. This prevents a late baseline from being starved by earlier
-candidate or optimization calls. Per-request output reservations are capped
+the supported total-token maximum is 50M. For `T` validation tasks and `R`
+repeats, resources are split into `2*T*R+4` units: one immutable unit per
+validation session, one for reflection, and three for optimization. Remainders
+stay with optimization. This prevents a late baseline from being starved by
+earlier candidate or optimization calls. Per-request output reservations are capped
 at 4096 and are not refunded. Total tokens reserve client request UTF-8 bytes
 plus 8192 framing tokens and output before dispatch, then reconcile to actual
 provider usage. Unknown usage keeps the conservative reservation. Unreported
@@ -151,3 +152,7 @@ PYTHONPATH=vendor/harness2-upstream python3 -m unittest discover -s vendor/harne
 
 See `vendor/harness2-upstream/PROVENANCE.json`, upstream `LICENSE`, and
 `docs/INTEGRATION_AUDIT.md` for source pins, extension evidence and limitations.
+
+The deterministic no-Docker judge smoke test is documented in
+`evaluation/no-docker-testkit/README.md`. It makes no model calls and is not an
+optimization-effect benchmark.
