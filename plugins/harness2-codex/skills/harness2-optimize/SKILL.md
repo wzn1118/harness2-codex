@@ -16,6 +16,12 @@ Use the plugin's MCP tools, not a prompt-only reconstruction.
    Call `harness2_estimate_budget` with task count, repeats and resource ceilings;
    explain that it estimates tokens/requests, not dollars. Obtain clear user
    approval of the spend before `harness2_run`.
+   The top-level `task` is a concrete representative project task for the PPC
+   rollout worker, such as repairing a named function under its documented
+   contract. It is not an instruction to run Harness2 or to edit harness files:
+   the upstream proposer/composer alone edit the candidate harness. Review this
+   distinction explicitly before spending. A recursive harness-optimization
+   request gives the rollout worker an impossible task and unusable evidence.
 3. Start with `k=1` and two validation repeats. Preserve the user's exact
    configured model unless the user explicitly selects a `model_provider` and
    `model` from the host Codex config/model catalog. Preflight that pair with
@@ -39,6 +45,12 @@ Use the plugin's MCP tools, not a prompt-only reconstruction.
    Inspect `codex_worker_errors`, `provider_responses_missing_usage` and
    `validation.invalidation_reasons`; preserve request IDs and do not infer an
    HTTP status that the provider response did not report.
+   Transient provider circuits may be probed by a fresh isolated retry or the
+   next independent session, within the existing retry and resource caps.
+   Above-estimate reported usage is charged in full and continues only inside
+   the same arm allocation. Do not bypass authentication, quota, permission
+   or actual budget failures. Distinguish completed records, passes and
+   infrastructure errors instead of treating a pass count as a stop condition.
 5. Before discussing application, call `harness2_preview_apply`. Application is
    eligible only after a valid protected multi-family suite supports positive
    lift and no paired regression. Show the diff and evidence. Only if the human
@@ -61,3 +73,11 @@ report it as invalid and do not present it as a valid optimization result. The
 system cannot guarantee that a model run will produce a candidate or a positive
 effect; never force one by changing the judge, retrying selectively, or editing
 the signed record.
+
+If the user requests cumulative operational acceptance, keep it separate from
+paired effect estimation. Freeze missing-row mappings before observing their
+recovery outcomes; retain original passes and every failure. Infrastructure
+fix revalidation must keep the frozen model, project, prompts, harness, judge
+and per-arm budgets, and cover both arms and original repeats of an affected
+task. Label a merged result as cumulative, not single-run; it cannot repair an
+invalid effect comparison or authorize deployment.

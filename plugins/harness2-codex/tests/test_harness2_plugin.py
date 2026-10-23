@@ -17,7 +17,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from h2 import common as C, project as P, guard
 from h2 import server
 from h2.deploy import deploy, rollback
-from h2.engine import ProjectAdapter, verify_pair, summarize_validation
+from h2.engine import CodexImprover, ProjectAdapter, verify_pair, summarize_validation
 from h2.runtime import host_config, ProviderFailure, Runtime, extract_codex_errors
 from h2.budget import Budget, allocation
 
@@ -29,6 +29,10 @@ class SafetyTests(unittest.TestCase):
         self.old=C.STATE;C.STATE=self.state;self.addCleanup(setattr,C,'STATE',self.old)
         (self.root/'AGENTS.md').write_text('# Existing\nNever weaken permissions.\n')
     def test_pinned_source_integrity(self):C.verify_upstream()
+    def test_pinned_source_hash_accepts_windows_checkout_newlines(self):
+        source=b"pinned source\nwith lines\n"
+        self.assertEqual(C.upstream_digest(source),C.upstream_digest(source.replace(b"\n",b"\r\n")))
+        self.assertNotEqual(C.upstream_digest(source),C.upstream_digest(source.replace(b"pinned",b"changed")))
     def test_codex_stream_errors_are_deduplicated_and_keep_only_safe_diagnostics(self):
         events=Path(self.temp.name)/'worker.jsonl'
         message='stream disconnected before completion; request_id: req-123; token=provider-secret'
@@ -63,12 +67,218 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(selected['model_provider'],'A6API')
             self.assertEqual(selected['model'],'gpt-6.1-sol')
             self.assertEqual(selected['provider_host'],'api.a6api.com')
+            self.assertEqual(selected['model_catalog_json'],str(catalog.resolve()))
             self.assertEqual(selected['key'],'a6api-test-secret')
             with self.assertRaisesRegex(ValueError,'model catalog'):
                 host_config('A6API','not-in-catalog')
         with patch.dict(os.environ,{'CODEX_HOME':str(home)},clear=True):
             with self.assertRaisesRegex(RuntimeError,'API-key-backed'):
                 host_config('A6API','gpt-6.1-sol')
+    def test_runtime_mounts_selected_model_catalog_read_only_into_worker(self):
+        run=self.state/'model-catalog-runtime';run.mkdir(parents=True)
+        work=self.state/'model-catalog-work';work.mkdir()
+        catalog=self.state/'models.json';catalog.write_text('{"models":[{"slug":"fixture-model"}]}')
+        config={'model':'fixture-model','base_url':'https://provider.invalid','key':'fixture-only',
+                'sandbox_mode':'workspace-write','approval_policy':'on-request',
+                'model_catalog_json':str(catalog)}
+        with patch('h2.runtime.binary_path',return_value=Path('/usr/bin/true')):
+            runtime=Runtime(run,threading.Event(),config)
+        mounts=[]
+        def fake_prefix(*args,**kwargs):
+            mounts.extend(kwargs['mounts'])
+            return []
+        def fake_process(cmd,**kwargs):
+            kwargs['stdout_path'].write_text('')
+            return {'exit_code':0,'stdout':'','stderr':'','wall_s':0,'stop_reason':None}
+        try:
+            with patch('h2.runtime.guard.prefix',side_effect=fake_prefix),patch('h2.runtime.guard.process',side_effect=fake_process):
+                runtime.call(work,'fixture prompt','catalog-worker')
+            worker_config=(run/'worker-homes/catalog-worker/config.toml').read_text()
+            self.assertIn('model_catalog_json = "/home/worker/model-catalog.json"',worker_config)
+            self.assertIn((runtime.model_catalog_asset,'/home/worker/model-catalog.json'),mounts)
+            self.assertEqual(runtime.model_catalog_asset.read_bytes(),catalog.read_bytes())
+            self.assertEqual(runtime.ledger()['model_catalog']['mounted_read_only'],True)
+            failed={'label':'failed-worker','infrastructure_errors':['stream disconnect']}
+            runtime.invocations.append(failed)
+            C.atomic(run/'invocations/failed-worker.json',failed)
+            runtime.record_codex_retry('failed-worker','failed-worker.retry1','stream disconnect',recovered=True)
+            self.assertEqual(runtime.invocations[-1]['recovered_by'],'failed-worker.retry1')
+            self.assertTrue(runtime.ledger()['codex_retries'][0]['recovered'])
+        finally:
+            runtime.close()
+    def test_codex_improver_retries_stream_disconnect_from_clean_context(self):
+        run=self.state/'retry-session';run.mkdir(parents=True)
+        context=run/'candidate';(context/'harness').mkdir(parents=True)
+        original='# Base instructions\n'
+        (context/'harness/AGENTS.md').write_text(original)
+        class RetryRuntime:
+            def __init__(self):self.calls=[];self.retries=[];self.assert_pristine=[];self.cancel=type('Cancel',(),{'wait':lambda _self,_delay:False})()
+            def call(self,work,mission,label,**kwargs):
+                self.calls.append(label)
+                target=work/'context/harness/AGENTS.md'
+                if len(self.calls)<3:
+                    self.assert_pristine.append(target.read_text()==original)
+                    target.write_text(original+f'partial attempt {len(self.calls)}\n')
+                    return {'exit_code':1,'last_message':'','stderr':'temporary stream failure','wall_s':len(self.calls),
+                            'codex_errors':[{'message':f'stream disconnected before completion; request_id: req-{len(self.calls)}'}]}
+                target.write_text(original+'complete retry\n')
+                return {'exit_code':0,'last_message':'<notes>completed</notes>','stderr':'','wall_s':3}
+            def record_codex_retry(self,**kwargs):self.retries.append(kwargs)
+        runtime=RetryRuntime()
+        adapter=type('Adapter',(),{'run':run,'runtime':runtime})()
+        reply=CodexImprover(adapter).call('fixture mission',context,'propose',harvest=True)
+        self.assertEqual(runtime.calls,['improve-propose','improve-propose.retry1','improve-propose.retry2'])
+        self.assertEqual(runtime.assert_pristine,[True,True])
+        self.assertEqual(reply.attempts,3)
+        self.assertEqual(reply.wall_s,6)
+        self.assertEqual((reply.workspace/'AGENTS.md').read_text(),original+'complete retry\n')
+        self.assertEqual(len(runtime.retries),2)
+        self.assertTrue(all(item['recovered'] for item in runtime.retries))
+        self.assertTrue(all(item['resolved_label']=='improve-propose.retry2' for item in runtime.retries))
+        self.assertEqual(runtime.retries[0]['failed_label'],'improve-propose')
+    def test_codex_improver_retries_transient_provider_errors_in_a_fresh_session(self):
+        from harness2.core.proposer import ProposerError
+        run=self.state/'provider-worker-retry';run.mkdir(parents=True)
+        context=run/'candidate';(context/'harness').mkdir(parents=True)
+        (context/'harness/AGENTS.md').write_text('# Base\n')
+        class RetryRuntime:
+            def __init__(self):self.calls=[];self.resets=[];self.retries=[]
+            cancel=type('Cancel',(),{'wait':lambda _self,_delay:False})()
+            def call(self,work,mission,label,**kwargs):
+                self.calls.append(label)
+                if len(self.calls)==1:
+                    return {'exit_code':1,'last_message':'','stderr':'HTTP 503','wall_s':1,
+                            'codex_errors':[{'message':'unexpected status 503 Service Unavailable'}]}
+                return {'exit_code':0,'last_message':'<notes>completed</notes>','stderr':'','wall_s':1}
+            def reset_transient_provider_circuit(self,*args):self.resets.append(args)
+            def record_codex_retry(self,**kwargs):self.retries.append(kwargs)
+        runtime=RetryRuntime()
+        adapter=type('Adapter',(),{'run':run,'runtime':runtime})()
+        with patch('h2.engine._pause_before_retry'):
+            reply=CodexImprover(adapter).call('fixture mission',context,'select')
+        self.assertEqual(reply.text,'<notes>completed</notes>')
+        self.assertEqual(runtime.calls,['improve-select','improve-select.retry1'])
+        self.assertEqual(runtime.resets[0][0],'improve-select')
+        self.assertTrue(runtime.retries[0]['recovered'])
+    def test_worker_retry_does_not_retry_permanent_provider_errors(self):
+        from harness2.core.proposer import ProposerError
+        run=self.state/'provider-permanent-error';run.mkdir(parents=True)
+        context=run/'candidate';(context/'harness').mkdir(parents=True)
+        (context/'harness/AGENTS.md').write_text('# Base\n')
+        class FailedRuntime:
+            def __init__(self):self.calls=[]
+            def call(self,work,mission,label,**kwargs):
+                self.calls.append(label)
+                return {'exit_code':1,'last_message':'','stderr':'HTTP 401','wall_s':1,
+                        'codex_errors':[{'message':'Upstream provider HTTP 401'}]}
+            def record_codex_retry(self,**kwargs):raise AssertionError('permanent errors must not be retried')
+        runtime=FailedRuntime()
+        adapter=type('Adapter',(),{'run':run,'runtime':runtime})()
+        with self.assertRaises(ProposerError):
+            CodexImprover(adapter).call('fixture mission',context,'select')
+        self.assertEqual(runtime.calls,['improve-select'])
+    def test_worker_retry_resets_explicit_upstream_unavailable_circuit(self):
+        from h2.engine import _prepare_transient_retry, _retry_reason
+        run=self.state/'provider-coded-circuit-reset';run.mkdir(parents=True)
+        config={'model':'fixture-model','base_url':'https://provider.invalid','key':'fixture-only',
+                'sandbox_mode':'read-only','approval_policy':'on-request'}
+        with patch('h2.runtime.binary_path',return_value=Path('/usr/bin/true')):
+            runtime=Runtime(run,threading.Event(),config)
+        try:
+            failure=runtime._record_provider_failure('improve-select',403,'provider-coded-error',
+                                                     transient_code='upstream_unavailable')
+            reason=_retry_reason({'infrastructure_errors':[str(failure)]})
+            self.assertIsNotNone(reason)
+            with patch('h2.engine._pause_before_retry'):
+                _prepare_transient_retry(runtime,0,'improve-select',reason)
+            self.assertIsNone(runtime.provider_circuit)
+            ledger=runtime.ledger()
+            self.assertEqual(len(ledger['provider_circuit_resets']),1)
+            self.assertEqual(ledger['provider_circuit_resets'][0]['transient_code'],'upstream_unavailable')
+            self.assertEqual(ledger['provider_circuit_resets'][0]['request_id'],'provider-coded-error')
+            self.assertEqual(ledger['provider_errors'][0]['status'],403)
+        finally:runtime.close()
+    def test_codex_improver_retries_worker_timeout_once(self):
+        run=self.state/'timeout-retry';run.mkdir(parents=True)
+        context=run/'candidate';(context/'harness').mkdir(parents=True)
+        (context/'harness/AGENTS.md').write_text('# Base\n')
+        class RetryRuntime:
+            def __init__(self):self.calls=[];self.retries=[];self.cancel=type('Cancel',(),{'wait':lambda _self,_delay:False})()
+            def call(self,work,mission,label,**kwargs):
+                self.calls.append(label)
+                if len(self.calls)==1:
+                    return {'exit_code':-9,'last_message':'','stderr':'timed out','wall_s':600,'stop_reason':'timeout'}
+                return {'exit_code':0,'last_message':'<notes>completed</notes>','stderr':'','wall_s':4}
+            def record_codex_retry(self,**kwargs):self.retries.append(kwargs)
+        runtime=RetryRuntime()
+        adapter=type('Adapter',(),{'run':run,'runtime':runtime})()
+        reply=CodexImprover(adapter).call('fixture mission',context,'compose',harvest=True)
+        self.assertEqual(runtime.calls,['improve-compose','improve-compose.retry1'])
+        self.assertEqual(reply.attempts,2)
+        self.assertTrue(runtime.retries[0]['recovered'])
+        self.assertEqual(runtime.retries[0]['reason'],'Codex worker execution timed out')
+    def test_project_rollout_retries_stream_failure_from_pristine_snapshot(self):
+        run=self.state/'rollout-stream-retry';run.mkdir(parents=True)
+        snapshot=run/'snapshot';P.snapshot(self.root,snapshot)
+        class RetryRuntime:
+            config={'model':'deterministic-test-only'}
+            def __init__(self):self.calls=[];self.retries=[];self.cancel=type('Cancel',(),{'wait':lambda _self,_delay:False})()
+            def call(self,work,mission,label,**kwargs):
+                self.calls.append(label)
+                partial=work/'result.txt'
+                if len(self.calls)==1:
+                    partial.write_text('partial first attempt')
+                    return {'exit_code':1,'last_message':'','stderr':'stream failed','wall_s':2,
+                            'codex_errors':[{'message':'stream disconnected before completion'}]}
+                self.pristine=not partial.exists()
+                partial.write_text('complete retry')
+                return {'exit_code':0,'last_message':'done','stderr':'','wall_s':3}
+            def record_codex_retry(self,**kwargs):self.retries.append(kwargs)
+        runtime=RetryRuntime()
+        adapter=ProjectAdapter(run,snapshot,'complete fixture task',runtime)
+        out=adapter.execute('project-task',None,'fixture')
+        invocation=C.read(out/'invocation.json')
+        self.assertEqual(runtime.calls,['roll-fixture','roll-fixture.retry1'])
+        self.assertTrue(runtime.pristine)
+        self.assertEqual(invocation['retry_count'],1)
+        self.assertEqual(invocation['attempt_labels'],runtime.calls)
+        self.assertTrue(adapter.delivered(out))
+        self.assertTrue(runtime.retries[0]['recovered'])
+    def test_holdout_retry_preserves_verifier_secrecy_and_arm_budget_label(self):
+        run=self.state/'holdout-stream-retry';run.mkdir(parents=True)
+        tests=self.root/'verifiers';tests.mkdir()
+        checker=tests/'check_fixture.py';checker.write_text('assert True\n')
+        snapshot=run/'snapshot';P.snapshot(self.root,snapshot)
+        observations=[]
+        class RetryRuntime:
+            config={'model':'deterministic-test-only'}
+            def __init__(self):self.calls=[];self.retries=[];self.cancel=type('Cancel',(),{'wait':lambda _self,_delay:False})()
+            def call(self,work,mission,label,**kwargs):
+                self.calls.append(label)
+                hidden=not (work/'verifiers/check_fixture.py').exists()
+                observations.append(hidden)
+                marker=work/'partial.txt'
+                if label.endswith('baseline'):
+                    marker.write_text('partial')
+                    return {'exit_code':1,'last_message':'','stderr':'stream failed','wall_s':1,
+                            'codex_errors':[{'message':'stream disconnected before completion'}]}
+                if label.endswith('baseline.retry1'):
+                    self.pristine_retry=not marker.exists()
+                return {'exit_code':0,'last_message':'completed','stderr':'','wall_s':2}
+            def record_codex_retry(self,**kwargs):self.retries.append(kwargs)
+        runtime=RetryRuntime()
+        adapter=ProjectAdapter(run,snapshot,'training task',runtime,['verifiers/check_fixture.py'])
+        task={'task_id':'heldout','family':'example','task':'different task',
+              'check_argv':['/usr/bin/true'],'protected_paths':['verifiers/check_fixture.py']}
+        with patch('h2.engine.guard.check_command',return_value={'exit_code':0,'wall_s':0,'stop_reason':None}):
+            result=verify_pair(adapter,adapter.original,{'validation_tasks':[task],'validation_repeats':1},threading.Event())
+        self.assertEqual(runtime.calls,['holdout-heldout-0-baseline','holdout-heldout-0-baseline.retry1','holdout-heldout-0-candidate'])
+        self.assertEqual(observations,[True,True,True])
+        self.assertTrue(runtime.pristine_retry)
+        self.assertEqual(result['rows'][0]['retry_count'],1)
+        self.assertEqual(result['rows'][0]['attempt_labels'],runtime.calls[:2])
+        self.assertTrue(result['comparison_valid'])
+        self.assertTrue(runtime.retries[0]['recovered'])
     def test_effect_benchmark_verifiers_reject_buggy_baseline(self):
         benchmark=Path(__file__).resolve().parents[1]/'evaluation/effect-benchmark'
         verifiers=sorted((benchmark/'verifiers').glob('check_*.py'))
@@ -90,6 +300,8 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'optimization'):budget.reserve('roll-base1',100)
         self.assertEqual(budget.reserve('holdout-4-baseline',100)['output'],4096)
         self.assertEqual(budget.reserve('holdout-4-candidate',100)['output'],4096)
+        retry=budget.reserve('holdout-4-baseline.retry2',100)
+        self.assertEqual(retry['scope'],'holdout-4-baseline')
     def test_missing_usage_retains_reservation_and_tokens_cannot_overrun(self):
         limits,plan=allocation({'max_requests':80,'max_output_tokens':327680,'max_total_tokens':100000,'validation_repeats':2})
         budget=Budget(limits,plan);r=budget.reserve('holdout-0-baseline',5000)
@@ -97,7 +309,66 @@ class SafetyTests(unittest.TestCase):
         budget.settle(r,None)
         self.assertEqual(budget.ledger()['charged']['holdout-0-baseline']['tokens'],before)
         with self.assertRaisesRegex(ValueError,'resource budget'):budget.reserve('holdout-0-baseline',5000)
-        with self.assertRaisesRegex(ValueError,'exceeds'):budget.settle(r,{'total_tokens':1000000})
+        with self.assertRaisesRegex(ValueError,'resource budget'):budget.settle(r,{'total_tokens':1000000})
+        self.assertEqual(budget.ledger()['charged']['holdout-0-baseline']['tokens'],1000000)
+        with self.assertRaisesRegex(ValueError,'resource budget'):budget.reserve('holdout-0-baseline',1)
+        self.assertEqual(budget.ledger()['charged']['holdout-0-candidate']['tokens'],0)
+    def test_reported_usage_above_request_estimate_continues_inside_session_cap(self):
+        limits,plan=allocation({'max_requests':1000,'max_output_tokens':4000000,
+                                'max_total_tokens':15000000,'validation_repeats':2,
+                                'validation_tasks':[{'task_id':f'task-{i}'} for i in range(10)]})
+        budget=Budget(limits,plan)
+        reservation=budget.reserve('holdout-task-0-0-baseline',40517)
+        self.assertEqual(reservation['tokens'],44613)
+        adjustment=budget.settle(reservation,{'input_tokens':133489,'output_tokens':263,
+                                               'total_tokens':133752})
+        self.assertEqual(adjustment['token_delta'],89139)
+        self.assertTrue(adjustment['within_allocation'])
+        self.assertEqual(budget.ledger()['charged']['holdout-task-0-0-baseline']['tokens'],133752)
+        self.assertEqual(budget.ledger()['usage_adjustments'],[adjustment])
+        budget.reserve('holdout-task-0-0-baseline',100)
+    def test_reported_output_overrun_is_charged_and_stops_at_session_cap(self):
+        budget=Budget({'requests':4,'output':4096,'tokens':100000},
+                      {'optimization':{'requests':4,'output':4096,'tokens':100000}})
+        reservation=budget.reserve('roll-output',100)
+        with self.assertRaisesRegex(ValueError,'resource budget'):
+            budget.settle(reservation,{'output_tokens':5000,'total_tokens':5100})
+        self.assertEqual(budget.ledger()['charged']['optimization']['output'],5000)
+        self.assertEqual(budget.ledger()['charged']['optimization']['tokens'],5100)
+        self.assertFalse(budget.ledger()['usage_adjustments'][0]['within_allocation'])
+    def test_reported_usage_adjustment_is_persisted_on_success_and_budget_rejection(self):
+        run=self.state/'provider-accounting';run.mkdir(parents=True)
+        config={'model':'fixture-model','base_url':'https://provider.invalid','key':'fixture-only',
+                'sandbox_mode':'read-only','approval_policy':'on-request'}
+        with patch('h2.runtime.binary_path',return_value=Path('/usr/bin/true')):
+            runtime=Runtime(run,threading.Event(),config)
+        class Response:
+            status=200
+            headers={'Content-Type':'application/json'}
+            def __init__(self,tokens):self.tokens=tokens
+            def __enter__(self):return self
+            def __exit__(self,*args):return False
+            def read(self,limit):return json.dumps({'usage':{'input_tokens':self.tokens-10,
+                                                           'output_tokens':10,
+                                                           'total_tokens':self.tokens}}).encode()
+        try:
+            with patch('h2.runtime.urllib.request.urlopen',return_value=Response(133752)):
+                runtime.forward('roll-adjust',{'model':'fixture-model','input':'probe'},'application/json')
+            ledger=C.read(run/'cost-ledger.json')
+            self.assertEqual(ledger['resource_envelopes']['charged']['optimization']['tokens'],133752)
+            self.assertTrue(ledger['resource_envelopes']['usage_adjustments'][0]['within_allocation'])
+            cap=runtime.budget.plan['optimization']['tokens']
+            with patch('h2.runtime.urllib.request.urlopen',return_value=Response(cap)) as upstream:
+                with self.assertRaisesRegex(ValueError,'resource budget'):
+                    runtime.forward('roll-over',{'model':'fixture-model','input':'probe'},'application/json')
+                ledger=C.read(run/'cost-ledger.json')
+                self.assertEqual(ledger['resource_envelopes']['charged']['optimization']['tokens'],cap+133752)
+                with self.assertRaisesRegex(ValueError,'resource budget'):
+                    runtime.forward('roll-over',{'model':'fixture-model','input':'probe'},'application/json')
+                self.assertEqual(upstream.call_count,1)
+            events=[json.loads(line) for line in (run/'events.jsonl').read_text().splitlines()]
+            self.assertTrue(any(item.get('usage_accounting_error') for item in events))
+        finally:runtime.close()
     def test_runtime_assets_survive_plugin_cache_removal_and_launcher_failure_is_invalid(self):
         import shutil
         run=self.state/'assets';run.mkdir(parents=True)
@@ -120,15 +391,15 @@ class SafetyTests(unittest.TestCase):
                 result=runtime.call(self.root,'fixture','holdout-0-baseline')
             self.assertIn('before any provider request',result['infrastructure_errors'][0])
         finally:runtime.close()
-    def test_provider_502_opens_circuit_once_and_records_safe_diagnostics(self):
+    def test_provider_retries_502_to_budget_then_opens_circuit_and_records_safe_diagnostics(self):
         run=self.state/'provider-circuit';run.mkdir(parents=True)
         config={'model':'fixture-model','base_url':'https://provider.invalid','key':'never-log-this',
                 'sandbox_mode':'read-only','approval_policy':'on-request'}
         with patch('h2.runtime.binary_path',return_value=Path('/usr/bin/true')):
             runtime=Runtime(run,threading.Event(),config)
         def upstream_502(*args,**kwargs):
-            headers=io.BytesIO(b'{"error":{"message":"temporary outage"}}')
-            response_headers={'x-request-id':'provider-req-123','Retry-After':'17'}
+            headers=io.BytesIO(b'{"error":{"message":"temporary outage never-log-this"}}')
+            response_headers={'x-request-id':'provider-req-123','Retry-After':'0'}
             raise urllib.error.HTTPError(
                 'https://provider.invalid/responses',502,'Bad Gateway',response_headers,headers)
         barrier=threading.Barrier(2)
@@ -142,14 +413,14 @@ class SafetyTests(unittest.TestCase):
         try:
             with patch('h2.runtime.urllib.request.urlopen',side_effect=upstream_502) as upstream:
                 with ThreadPoolExecutor(max_workers=2) as executor:
-                    errors=list(executor.map(call,('roll-first','roll-second')))
-                self.assertEqual(upstream.call_count,1)
+                    errors=list(executor.map(call,('roll-first','roll-first')))
+                self.assertEqual(upstream.call_count,3)
             self.assertEqual({error.status for error in errors},{502})
             self.assertTrue(any('circuit opened' in str(error) for error in errors))
             self.assertTrue(any('Provider circuit open' in str(error) for error in errors))
             self.assertTrue(all('never-log-this' not in str(error) for error in errors))
             with runtime.lock:
-                runtime.tokens['proxy-fixture-token']='roll-proxy'
+                runtime.tokens['proxy-fixture-token']='roll-first'
             connection=http.client.HTTPConnection('localhost')
             connection.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
             connection.sock.connect(runtime.server.server_address)
@@ -163,12 +434,166 @@ class SafetyTests(unittest.TestCase):
             self.assertIn('provider-req-123',error_body['error']['message'])
             self.assertNotIn('temporary outage',json.dumps(error_body))
             ledger=runtime.ledger()
-            self.assertEqual(ledger['provider_requests'],1)
+            self.assertEqual(ledger['provider_requests'],3)
             self.assertEqual(ledger['provider_errors'][0]['request_id'],'provider-req-123')
-            self.assertEqual(ledger['provider_errors'][1]['blocked'],True)
-            self.assertNotIn('temporary outage',json.dumps(ledger))
+            self.assertEqual(ledger['provider_errors'][0]['detail'],'temporary outage [REDACTED]')
+            self.assertEqual(ledger['provider_errors'][1]['attempt'],2)
+            self.assertEqual(ledger['provider_errors'][2]['circuit_open'],True)
+            self.assertEqual(ledger['provider_errors'][3]['blocked'],True)
+            self.assertEqual(len(ledger['provider_retries']),2)
+            self.assertEqual(ledger['provider_retries'][0]['recovered'],False)
+            self.assertEqual(ledger['provider_retries'][1]['recovered'],False)
+            self.assertIn('temporary outage',json.dumps(ledger))
             self.assertNotIn('never-log-this',json.dumps(ledger))
-            self.assertEqual(runtime.budget.ledger()['charged']['optimization']['requests'],1)
+            self.assertEqual(runtime.budget.ledger()['charged']['optimization']['requests'],3)
+        finally:runtime.close()
+    def test_new_session_probes_after_transient_circuit_but_not_auth_failure(self):
+        run=self.state/'provider-next-session';run.mkdir(parents=True)
+        config={'model':'fixture-model','base_url':'https://provider.invalid','key':'fixture-only',
+                'sandbox_mode':'read-only','approval_policy':'on-request'}
+        with patch('h2.runtime.binary_path',return_value=Path('/usr/bin/true')):
+            runtime=Runtime(run,threading.Event(),config)
+        class SuccessResponse:
+            status=200
+            headers={'Content-Type':'application/json'}
+            def __enter__(self):return self
+            def __exit__(self,*args):return False
+            def read(self,limit):return b'{"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}'
+        try:
+            runtime._record_provider_failure('roll-failed',503,'req-first')
+            with patch('h2.runtime.urllib.request.urlopen',return_value=SuccessResponse()) as upstream:
+                with self.assertRaises(ProviderFailure):
+                    runtime.forward('roll-failed',{'model':'fixture-model'},'application/json')
+                self.assertEqual(upstream.call_count,0)
+                runtime.forward('roll-next',{'model':'fixture-model'},'application/json')
+                self.assertEqual(upstream.call_count,1)
+                self.assertEqual(len(runtime.ledger()['provider_circuit_resets']),1)
+                runtime._record_provider_failure('roll-auth',401,'req-auth')
+                with self.assertRaises(ProviderFailure):
+                    runtime.forward('roll-after-auth',{'model':'fixture-model'},'application/json')
+                self.assertEqual(upstream.call_count,1)
+        finally:runtime.close()
+    def test_transient_provider_circuit_can_be_reset_and_is_audited(self):
+        run=self.state/'provider-circuit-reset';run.mkdir(parents=True)
+        config={'model':'fixture-model','base_url':'https://provider.invalid','key':'fixture-only',
+                'sandbox_mode':'read-only','approval_policy':'on-request'}
+        with patch('h2.runtime.binary_path',return_value=Path('/usr/bin/true')):
+            runtime=Runtime(run,threading.Event(),config)
+        try:
+            runtime.provider_circuit={'status':503,'provider_host':'provider.invalid',
+                                      'request_id':'req-transient','retry_after':'1'}
+            self.assertTrue(runtime.reset_transient_provider_circuit('holdout-task','HTTP 503'))
+            self.assertIsNone(runtime.provider_circuit)
+            self.assertEqual(runtime.ledger()['provider_circuit_resets'][0]['request_id'],'req-transient')
+            runtime.provider_circuit={'status':401,'provider_host':'provider.invalid',
+                                      'request_id':'req-permanent','retry_after':None}
+            self.assertFalse(runtime.reset_transient_provider_circuit('holdout-task','HTTP 401'))
+            self.assertEqual(runtime.provider_circuit['status'],401)
+        finally:runtime.close()
+    def test_a6api_upstream_unavailable_403_retries_by_error_code_only(self):
+        run=self.state/'provider-upstream-unavailable';run.mkdir(parents=True)
+        config={'model':'fixture-model','base_url':'https://api.a6api.com/v1','key':'fixture-only',
+                'sandbox_mode':'read-only','approval_policy':'on-request'}
+        with patch('h2.runtime.binary_path',return_value=Path('/usr/bin/true')):
+            runtime=Runtime(run,threading.Event(),config)
+        class SuccessResponse:
+            status=200
+            headers={'x-request-id':'provider-req-200','Content-Type':'application/json'}
+            def __enter__(self):return self
+            def __exit__(self,*args):return False
+            def read(self,limit):return b'{"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}'
+        def unavailable(request_id):
+            body=json.dumps({'error':{'type':'upstream_error','code':'upstream_unavailable',
+                                      'message':'temporarily unavailable'}}).encode()
+            return urllib.error.HTTPError('https://api.a6api.com/v1/responses',403,'Forbidden',
+                                          {'x-request-id':request_id},io.BytesIO(body))
+        try:
+            with patch('h2.runtime.urllib.request.urlopen',side_effect=[unavailable('a6-1'),unavailable('a6-2'),SuccessResponse()]) as upstream, \
+                 patch.object(runtime.cancel,'wait',return_value=False):
+                runtime.forward('roll-a6api',{'model':'fixture-model','input':'probe'},'application/json')
+            self.assertEqual(upstream.call_count,3)
+            ledger=runtime.ledger()
+            self.assertEqual([row['status'] for row in ledger['provider_retries']],[403,403])
+            self.assertTrue(all(row['transient_code']=='upstream_unavailable' for row in ledger['provider_retries']))
+            self.assertTrue(all(row['recovered'] for row in ledger['provider_retries']))
+            self.assertFalse(ledger['provider_errors'][-1].get('circuit_open'))
+        finally:runtime.close()
+    def test_provider_transient_502_retry_is_budgeted_and_audited_when_recovered(self):
+        run=self.state/'provider-retry';run.mkdir(parents=True)
+        config={'model':'fixture-model','base_url':'https://provider.invalid','key':'fixture-only',
+                'sandbox_mode':'read-only','approval_policy':'on-request'}
+        with patch('h2.runtime.binary_path',return_value=Path('/usr/bin/true')):
+            runtime=Runtime(run,threading.Event(),config)
+        class SuccessResponse:
+            status=200
+            headers={'x-request-id':'provider-req-200','Content-Type':'application/json'}
+            def __enter__(self):return self
+            def __exit__(self,*args):return False
+            def read(self,limit):
+                return b'{"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}'
+        failure_body=io.BytesIO(b'{"error":{"message":"temporary outage"}}')
+        failure=urllib.error.HTTPError('https://provider.invalid/responses',502,'Bad Gateway',
+                                       {'x-request-id':'provider-req-502','Retry-After':'0'},failure_body)
+        failure_2=urllib.error.HTTPError('https://provider.invalid/responses',503,'Service Unavailable',
+                                         {'x-request-id':'provider-req-503','Retry-After':'0'},
+                                         io.BytesIO(b'{"error":{"message":"temporary outage again"}}'))
+        try:
+            with patch('h2.runtime.urllib.request.urlopen',side_effect=[failure,failure_2,SuccessResponse()]) as upstream:
+                payload,_=runtime.forward('roll-retry',{'model':'fixture-model','input':'probe'},'application/json')
+            self.assertEqual(upstream.call_count,3)
+            self.assertEqual(json.loads(payload)['usage']['total_tokens'],12)
+            ledger=runtime.ledger()
+            self.assertEqual(ledger['provider_requests'],3)
+            self.assertFalse(ledger['usage_complete'])
+            self.assertEqual(ledger['total_tokens'],12)
+            self.assertEqual(ledger['provider_errors'][0]['recovered'],True)
+            self.assertEqual(ledger['provider_errors'][1]['recovered'],True)
+            self.assertEqual(ledger['provider_retries'][0]['recovered'],True)
+            self.assertEqual(ledger['provider_retries'][1]['recovered'],True)
+            self.assertEqual(runtime.budget.ledger()['charged']['optimization']['requests'],3)
+            records=[json.loads(line) for line in (run/'events.jsonl').read_text().splitlines()]
+            self.assertIn('provider_retry_recovered',[row['kind'] for row in records])
+        finally:runtime.close()
+    def test_provider_429_fails_closed_without_retry(self):
+        run=self.state/'provider-429';run.mkdir(parents=True)
+        config={'model':'fixture-model','base_url':'https://provider.invalid','key':'fixture-only',
+                'sandbox_mode':'read-only','approval_policy':'on-request'}
+        with patch('h2.runtime.binary_path',return_value=Path('/usr/bin/true')):
+            runtime=Runtime(run,threading.Event(),config)
+        failure=urllib.error.HTTPError('https://provider.invalid/responses',429,'Too Many Requests',
+                                       {'x-request-id':'provider-req-429'},io.BytesIO(b'{}'))
+        try:
+            with patch('h2.runtime.urllib.request.urlopen',side_effect=failure) as upstream:
+                with self.assertRaises(ProviderFailure) as raised:
+                    runtime.forward('roll-429',{'model':'fixture-model','input':'probe'},'application/json')
+            self.assertEqual(raised.exception.status,429)
+            self.assertEqual(upstream.call_count,1)
+            self.assertEqual(runtime.ledger()['provider_requests'],1)
+            self.assertEqual(runtime.ledger()['provider_retries'],[])
+        finally:runtime.close()
+    def test_local_budget_rejection_is_not_reported_as_upstream_502(self):
+        run=self.state/'local-budget-rejection';run.mkdir(parents=True)
+        config={'model':'fixture-model','base_url':'https://provider.invalid','key':'fixture-only',
+                'sandbox_mode':'read-only','approval_policy':'on-request'}
+        budget={'max_requests':8,'max_output_tokens':8192,'max_total_tokens':100000}
+        with patch('h2.runtime.binary_path',return_value=Path('/usr/bin/true')):
+            runtime=Runtime(run,threading.Event(),config,max_requests=8,max_output_tokens=8192,budget_request=budget)
+        try:
+            with runtime.lock:runtime.tokens['proxy-budget-token']='roll-budget'
+            connection=http.client.HTTPConnection('localhost')
+            connection.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+            connection.sock.connect(runtime.server.server_address)
+            body=json.dumps({'model':'fixture-model','input':'x'*40000})
+            connection.request('POST','/responses',body=body,headers={
+                'Authorization':'Bearer proxy-budget-token','Content-Type':'application/json'})
+            response=connection.getresponse();response.read();connection.close()
+            self.assertEqual(response.status,429)
+            ledger=runtime.ledger()
+            self.assertEqual(ledger['provider_requests'],0)
+            self.assertEqual(ledger['provider_errors'],[])
+            events=[json.loads(line) for line in (run/'events.jsonl').read_text().splitlines()]
+            self.assertIn('broker_request_rejected',[row['kind'] for row in events])
+            self.assertNotIn('provider_error',[row['kind'] for row in events])
         finally:runtime.close()
     def test_incomplete_provider_stream_is_transport_error_not_upstream_http_status(self):
         run=self.state/'incomplete-stream';run.mkdir(parents=True)
@@ -183,21 +608,56 @@ class SafetyTests(unittest.TestCase):
             def __exit__(self,*args):return False
             def read(self,*args):raise http.client.IncompleteRead(b'data: partial')
         try:
-            with patch('h2.runtime.urllib.request.urlopen',return_value=IncompleteResponse()):
+            with patch('h2.runtime.urllib.request.urlopen',side_effect=[IncompleteResponse(),IncompleteResponse()]) as upstream:
                 with self.assertRaises(ProviderFailure) as caught:
                     runtime.forward('roll-stream',{'model':'fixture-model','input':'short probe'},'text/event-stream')
+            self.assertEqual(upstream.call_count,2)
             self.assertEqual(caught.exception.status,503)
             self.assertEqual(caught.exception.transport,'IncompleteRead')
-            record=runtime.ledger()['provider_errors'][0]
+            ledger=runtime.ledger()
+            record=ledger['provider_errors'][0]
+            self.assertIsNone(record['status'])
             self.assertEqual(record['status_origin'],'local_transport_mapping')
             self.assertEqual(record['provider_host'],'api.a6api.com')
             bill=runtime.billing[0]
             self.assertEqual(bill['http_status'],200)
             self.assertFalse(bill.get('response_read_complete',False))
-            ledger=runtime.ledger()
-            self.assertEqual(ledger['provider_responses_missing_usage'],1)
+            self.assertEqual(ledger['provider_requests'],2)
+            self.assertEqual(ledger['provider_retries'][0]['transport'],'IncompleteRead')
+            self.assertFalse(ledger['provider_retries'][0]['recovered'])
+            self.assertEqual(ledger['provider_responses_missing_usage'],2)
             self.assertFalse(ledger['usage_complete'])
             self.assertNotIn('never-log-this',json.dumps(ledger))
+        finally:runtime.close()
+    def test_incomplete_provider_body_retries_once_and_recovers(self):
+        run=self.state/'incomplete-stream-retry';run.mkdir(parents=True)
+        config={'model':'fixture-model','base_url':'https://provider.invalid','key':'fixture-only',
+                'sandbox_mode':'read-only','approval_policy':'on-request'}
+        with patch('h2.runtime.binary_path',return_value=Path('/usr/bin/true')):
+            runtime=Runtime(run,threading.Event(),config)
+        class IncompleteResponse:
+            status=200
+            headers={'x-request-id':'stream-req-cut','Content-Type':'text/event-stream'}
+            def __enter__(self):return self
+            def __exit__(self,*args):return False
+            def read(self,*args):raise http.client.IncompleteRead(b'data: partial')
+        class SuccessResponse:
+            status=200
+            headers={'x-request-id':'stream-req-ok','Content-Type':'application/json'}
+            def __enter__(self):return self
+            def __exit__(self,*args):return False
+            def read(self,*args):return b'{"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}'
+        try:
+            with patch('h2.runtime.urllib.request.urlopen',side_effect=[IncompleteResponse(),SuccessResponse()]) as upstream:
+                payload,_=runtime.forward('roll-stream-retry',{'model':'fixture-model','input':'probe'},'application/json')
+            self.assertEqual(upstream.call_count,2)
+            self.assertEqual(json.loads(payload)['usage']['total_tokens'],5)
+            ledger=runtime.ledger()
+            self.assertEqual(ledger['provider_requests'],2)
+            self.assertTrue(ledger['provider_retries'][0]['recovered'])
+            self.assertTrue(ledger['provider_errors'][0]['recovered'])
+            self.assertFalse(ledger['usage_complete'])
+            self.assertEqual(runtime.budget.ledger()['charged']['optimization']['requests'],2)
         finally:runtime.close()
     def test_runtime_stream_error_event_reaches_signed_audit_record(self):
         run=self.state/'worker-stream-error';run.mkdir(parents=True)

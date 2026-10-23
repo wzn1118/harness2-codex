@@ -23,6 +23,9 @@ def stamp():
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
+def upstream_digest(data):
+    return digest(data.replace(b"\r\n", b"\n"))
+
 def canonical(obj):
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
@@ -96,4 +99,4 @@ def verify_upstream():
     provenance = read(UPSTREAM / "PROVENANCE.json")
     if provenance["commit"] != COMMIT: raise ValueError("Unexpected upstream revision")
     for entry in provenance["files"]:
-        if digest((UPSTREAM / entry["path"]).read_bytes()) != entry["sha256"]: raise ValueError("Upstream source tampered: " + entry["path"])
+        if upstream_digest((UPSTREAM / entry["path"]).read_bytes()) != entry["sha256"]: raise ValueError("Upstream source tampered: " + entry["path"])

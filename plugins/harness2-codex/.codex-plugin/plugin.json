@@ -1,6 +1,6 @@
 {
   "name": "harness2-codex",
-  "version": "0.2.0+codex.20261023040001",
+  "version": "0.2.0+codex.20261023135403",
   "description": "Real Harness\u00b2 Propose-Probe-Compose optimization for Codex with protected multi-task evaluation, family-bootstrap evidence, isolation, human-gated apply, rollback, and cost ledgers.",
   "author": {
     "name": "wzn1118"

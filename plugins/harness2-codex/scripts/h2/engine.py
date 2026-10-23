@@ -7,10 +7,12 @@ import io
 import json
 import os
 import random
+import re
 import secrets
 import shutil
 import sys
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from . import common as C, guard, project as P
@@ -25,6 +27,43 @@ from harness2.substrate.codex import CODEX_SURFACE, render_events
 
 ENGINE_LOCK = threading.Lock()
 MIN_CONFIRMATORY_FAMILIES = 10
+MAX_WORKER_RETRIES = 2
+
+def _pause_before_retry(runtime, attempt):
+    delay=min(2**(attempt+1),30)
+    cancel=getattr(runtime,"cancel",None)
+    if cancel is not None:
+        if cancel.wait(delay):
+            raise RuntimeError("Experiment cancelled before transient retry")
+    else:
+        time.sleep(delay)
+
+def _retry_reason(result):
+    if result.get("stop_reason") == "timeout":
+        return "Codex worker execution timed out"
+    messages=[str(error.get("message","")) for error in result.get("codex_errors",[])]
+    messages.extend(str(error) for error in result.get("infrastructure_errors",[]))
+    for message in messages:
+        if "stream disconnected before completion" in message.casefold():
+            return message[:1000]
+        if "upstream_unavailable" in message.casefold():
+            return f"Transient provider upstream_unavailable: {message[:900]}"
+        match=re.search(r"(?:\bHTTP\s*|\bstatus\s+)(502|503|504)\b",message,re.I)
+        if match:
+            return f"Transient provider HTTP {match.group(1)}: {message[:900]}"
+    return None
+
+def _prepare_transient_retry(runtime, attempt, failed_label, reason):
+    _pause_before_retry(runtime,attempt)
+    if reason.casefold().startswith(("transient provider http ",
+                                    "transient provider upstream_unavailable:")):
+        reset=getattr(runtime,"reset_transient_provider_circuit",None)
+        if reset:
+            reset(failed_label,reason)
+
+def _retry_recovered(result):
+    return (result.get("exit_code")==0 and not result.get("stop_reason")
+            and not result.get("infrastructure_errors") and not result.get("codex_errors"))
 
 class Substrate:
     name = "cx"
@@ -56,11 +95,33 @@ class ProjectAdapter:
         self.validate_tree(surface)
         out = self.run / "rollouts" / run_id
         out.mkdir(parents=True,exist_ok=False)
-        work = out / "workspace";P.materialize(self.snapshot,work,surface,exclude=self.private_paths)
-        before = P.tree_hash(work)
-        task_files_before=P.scan(work)
-        result = self.runtime.call(work,self.task + "\n\nDo the task in /work. Do not alter AGENTS.md, Skills, harness2-tools.json, or harness2-execution.json. Do not change tests or permission policies. Report commands and observed results.","roll-"+run_id,strategy=json.loads(surface[P.STRATEGY]),tools=json.loads(surface[P.TOOLS]))
-        P.reject_worker_links(work)
+        attempt_labels=[]
+        attempt_history=[]
+        retry_records=[]
+        for attempt in range(MAX_WORKER_RETRIES+1):
+            suffix="" if attempt==0 else f".retry{attempt}"
+            label="roll-"+run_id+suffix
+            work=out/("workspace" if attempt==0 else f"workspace.retry{attempt}")
+            P.materialize(self.snapshot,work,surface,exclude=self.private_paths)
+            before=P.tree_hash(work)
+            task_files_before=P.scan(work)
+            result=self.runtime.call(work,self.task + "\n\nDo the task in /work. Do not alter AGENTS.md, Skills, harness2-tools.json, or harness2-execution.json. Do not change tests or permission policies. Report commands and observed results.",label,strategy=json.loads(surface[P.STRATEGY]),tools=json.loads(surface[P.TOOLS]))
+            attempt_labels.append(label)
+            attempt_history.append({"label":label,"exit_code":result.get("exit_code"),"stop_reason":result.get("stop_reason"),"wall_s":result.get("wall_s"),"infrastructure_errors":result.get("infrastructure_errors",[])})
+            P.reject_worker_links(work)
+            reason=_retry_reason(result)
+            if attempt<MAX_WORKER_RETRIES and reason:
+                retry_records.append({"failed_label":label,"retry_label":"roll-"+run_id+f".retry{attempt+1}","reason":reason})
+                _prepare_transient_retry(self.runtime,attempt,label,reason)
+                continue
+            for retry_record in retry_records:
+                self.runtime.record_codex_retry(**retry_record,recovered=_retry_recovered(result),
+                                                resolved_label=attempt_labels[-1] if _retry_recovered(result) else None)
+            break
+        result["retry_count"]=len(attempt_labels)-1
+        result["attempt_labels"]=attempt_labels
+        result["attempt_history"]=attempt_history
+        result["retry_reason"]=retry_records[-1]["reason"] if retry_records else None
         changes = P.tree_hash(work)
         edited_harness = [n for n in surface if changes.get(n)!=before.get(n)]
         result["harness_mutated"] = edited_harness
@@ -87,23 +148,44 @@ class ProjectAdapter:
 class CodexImprover:
     def __init__(self,adapter): self.adapter=adapter;self._calls=[];self.lock=threading.RLock()
     def call(self,mission,context_dir,label,**kwargs):
-        session=self.adapter.run/"sessions"/label
-        session.mkdir(parents=True,exist_ok=False)
-        shutil.copytree(context_dir,session/"context")
-        before=P.tree_hash(session)
         directions="\n\nThis session uses an additive-only safe project adapter. Edit only context/harness/AGENTS.md, .agents/skills/* components within context/harness/, context/harness/harness2-tools.json (shell/apply_patch booleans), or context/harness/harness2-execution.json (reasoning_effort low/medium/high, timeout_sec 30..600). The adapter's JSON configuration files are controls, not prose: keep them valid JSON with exactly their existing keys. Preserve all existing instruction text verbatim as a prefix; existing scripts are immutable. Never create hooks, subagents, arbitrary MCP commands, or permission changes. Editing tool/strategy JSON changes actual executor options. For selection or reflection do not edit any file. Reply using the exact structured blocks requested by the upstream mission."
         readonly=not kwargs.get("harvest")
-        r=self.adapter.runtime.call(session,mission+directions,"improve-"+label,readonly=readonly)
-        try:P.reject_worker_links(session)
-        except ValueError as exc:raise ProposerError(str(exc),attempts=1) from exc
-        after=P.tree_hash(session)
-        changed={n for n in set(before)|set(after) if before.get(n)!=after.get(n)}
-        illegal=[n for n in changed if not n.startswith("context/harness/")]
-        if r["exit_code"] or not r["last_message"].strip() or illegal:
-            raise ProposerError("Codex session failed or changed evidence outside harness: "+str(illegal)+" "+r["stderr"][-700:],attempts=1)
-        reply=Reply(label=label,text=r["last_message"],ok=True,attempts=1,wall_s=r["wall_s"],workspace=session/"context/harness" if kwargs.get("harvest") else None)
-        with self.lock:self._calls.append(reply)
-        return reply
+        retry_records=[]
+        wall_s=0
+        for attempt in range(MAX_WORKER_RETRIES+1):
+            suffix="" if attempt==0 else f".retry{attempt}"
+            session_label=label+suffix
+            session=self.adapter.run/"sessions"/session_label
+            session.mkdir(parents=True,exist_ok=False)
+            shutil.copytree(context_dir,session/"context")
+            before=P.tree_hash(session)
+            runtime_label="improve-"+session_label
+            r=self.adapter.runtime.call(session,mission+directions,runtime_label,readonly=readonly)
+            wall_s+=r.get("wall_s",0)
+            try:P.reject_worker_links(session)
+            except ValueError as exc:
+                for retry_record in retry_records:
+                    self.adapter.runtime.record_codex_retry(**retry_record,recovered=False)
+                raise ProposerError(str(exc),attempts=attempt+1) from exc
+            after=P.tree_hash(session)
+            changed={n for n in set(before)|set(after) if before.get(n)!=after.get(n)}
+            illegal=[n for n in changed if not n.startswith("context/harness/")]
+            if r["exit_code"] or not r["last_message"].strip() or illegal or r.get("stop_reason") or r.get("infrastructure_errors") or r.get("codex_errors"):
+                reason=_retry_reason(r)
+                if attempt<MAX_WORKER_RETRIES and reason and not illegal:
+                    retry_records.append({"failed_label":runtime_label,"retry_label":"improve-"+label+f".retry{attempt+1}","reason":reason})
+                    _prepare_transient_retry(self.adapter.runtime,attempt,runtime_label,reason)
+                    continue
+                for retry_record in retry_records:
+                    self.adapter.runtime.record_codex_retry(**retry_record,recovered=False)
+                raise ProposerError("Codex session failed or changed evidence outside harness: "+str(illegal)+" "+r["stderr"][-700:],attempts=attempt+1)
+            for retry_record in retry_records:
+                self.adapter.runtime.record_codex_retry(**retry_record,recovered=_retry_recovered(r),
+                                                        resolved_label=runtime_label if _retry_recovered(r) else None)
+            reply=Reply(label=label,text=r["last_message"],ok=True,attempts=attempt+1,wall_s=wall_s,workspace=session/"context/harness" if kwargs.get("harvest") else None)
+            with self.lock:self._calls.append(reply)
+            return reply
+        raise ProposerError("Codex session failed after transient stream retries",attempts=MAX_WORKER_RETRIES+1)
 
 def summarize_validation(rows,repeats,tasks=None,*,candidate_unchanged=False):
     if tasks is None:
@@ -178,10 +260,26 @@ def verify_pair(adapter,selected,request,cancel):
         for kind in order:
             surface=adapter.original if kind=="baseline" else selected
             dest=adapter.run/"holdout"/task["task_id"]/f"{trial}-{kind}";dest.mkdir(parents=True)
-            work=dest/"workspace";P.materialize(adapter.snapshot,work,surface,exclude=adapter.private_paths)
             label=f"holdout-{trial}-{kind}" if len(tasks)==1 and task["task_id"]=="primary" else f"holdout-{task['task_id']}-{trial}-{kind}"
-            result=adapter.runtime.call(work,task["task"]+"\n\nComplete the task in /work. Do not alter harness files, permissions, or tests. The held-out verifier files are intentionally unavailable. Report actual results.",label,strategy=json.loads(surface[P.STRATEGY]),tools=json.loads(surface[P.TOOLS]))
-            P.reject_worker_links(work)
+            attempt_labels=[]
+            retry_records=[]
+            for attempt in range(MAX_WORKER_RETRIES+1):
+                suffix="" if attempt==0 else f".retry{attempt}"
+                attempt_label=label+suffix
+                work=dest/("workspace" if attempt==0 else f"workspace.retry{attempt}")
+                P.materialize(adapter.snapshot,work,surface,exclude=adapter.private_paths)
+                result=adapter.runtime.call(work,task["task"]+"\n\nComplete the task in /work. Do not alter harness files, permissions, or tests. The held-out verifier files are intentionally unavailable. Report actual results.",attempt_label,strategy=json.loads(surface[P.STRATEGY]),tools=json.loads(surface[P.TOOLS]))
+                attempt_labels.append(attempt_label)
+                P.reject_worker_links(work)
+                reason=_retry_reason(result)
+                if attempt<MAX_WORKER_RETRIES and reason:
+                    retry_records.append({"failed_label":attempt_label,"retry_label":label+f".retry{attempt+1}","reason":reason})
+                    _prepare_transient_retry(adapter.runtime,attempt,attempt_label,reason)
+                    continue
+                for retry_record in retry_records:
+                    adapter.runtime.record_codex_retry(**retry_record,recovered=_retry_recovered(result),
+                                                       resolved_label=attempt_labels[-1] if _retry_recovered(result) else None)
+                break
             # Only the independent judge receives its declared verifier files.
             for name in task.get("protected_paths",[]):
                 data=(adapter.snapshot/name).read_bytes()
@@ -196,7 +294,7 @@ def verify_pair(adapter,selected,request,cancel):
                            "agent_failure" if result["exit_code"]!=0 else
                            "verifier_failure" if check["exit_code"]!=0 else
                            "harness_mutation" if forbidden else "pass")
-            rows.append({"task_id":task["task_id"],"family":task["family"],"trial":trial,"kind":kind,"check":check,"failure_class":failure_class,"harness_mutations":forbidden,"agent_exit_code":result["exit_code"],"agent_stop_reason":result.get("stop_reason"),"infrastructure_errors":result.get("infrastructure_errors",[]),"agent_wall_s":result.get("wall_s"),"known_provider_usage":result.get("known_provider_usage"),"passed":passed})
+            rows.append({"task_id":task["task_id"],"family":task["family"],"trial":trial,"kind":kind,"check":check,"failure_class":failure_class,"harness_mutations":forbidden,"agent_exit_code":result["exit_code"],"agent_stop_reason":result.get("stop_reason"),"infrastructure_errors":result.get("infrastructure_errors",[]),"agent_wall_s":result.get("wall_s"),"known_provider_usage":result.get("known_provider_usage"),"retry_count":len(attempt_labels)-1,"retry_reason":retry_records[-1]["reason"] if retry_records else None,"attempt_labels":attempt_labels,"passed":passed})
             C.atomic(adapter.run/"holdout-results.json",rows)
             C.event(adapter.run,"holdout_check",result=rows[-1])
     changed_surface=any(selected.get(name)!=adapter.original.get(name) for name in set(selected)|set(adapter.original))
@@ -246,7 +344,8 @@ def experiment(run,request,cancel):
         C.atomic(run/"upstream-result.json",result.to_dict());C.atomic(run/"selection.json",chosen.to_dict())
         selected=result.trees.get(chosen.chosen_label) if chosen.ok and not chosen.fallback else None
         invocations=getattr(runtime,"invocations",[])
-        ppc_infrastructure_failures=[{"label":item.get("label"),"error_count":len(item.get("infrastructure_errors",[])),"stop_reason":item.get("stop_reason")} for item in invocations if item.get("infrastructure_errors") or item.get("stop_reason")]
+        recovered_labels={item.get("failed_label") for item in getattr(runtime,"codex_retries",[]) if item.get("recovered")}
+        ppc_infrastructure_failures=[{"label":item.get("label"),"error_count":len(item.get("infrastructure_errors",[])),"stop_reason":item.get("stop_reason")} for item in invocations if item.get("label") not in recovered_labels and (item.get("infrastructure_errors") or item.get("stop_reason"))]
         experience={};validation=None;status="no_adoption"
         original_files=adapter.original_files
         changes={n:text.encode() for n,text in (selected or {}).items() if original_files.get(n)!=text.encode() and (n in original_files or text!=adapter.original.get(n))}

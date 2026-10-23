@@ -39,10 +39,14 @@ class Budget:
     def __init__(self, limits, plan):
         self.limits, self.plan = limits, plan
         self.used = {name: dict.fromkeys(limits, 0) for name in plan}
+        self.usage_adjustments = []
         self.lock = threading.RLock()
 
     def scope(self, label):
         if label.startswith('holdout-'):
+            base_label, separator, retry_number = label.rpartition('.retry')
+            if separator and retry_number.isdigit() and base_label in self.plan:
+                return base_label
             if label not in self.plan:
                 raise ValueError('Unallocated validation session')
             return label
@@ -66,14 +70,34 @@ class Budget:
     def settle(self, reservation, usage):
         if not usage:
             return
-        actual = int(usage.get('total_tokens', 0))
-        if not actual or actual > reservation['tokens']:
-            raise ValueError('Provider usage exceeds conservative request reservation')
+        actual = usage.get('total_tokens')
+        output = usage.get('output_tokens', 0)
+        if type(actual) is not int or actual <= 0 or type(output) is not int or not 0 <= output <= actual:
+            raise ValueError('Invalid provider usage; request reservation retained')
         with self.lock:
-            self.used[reservation['scope']]['tokens'] -= reservation['tokens'] - actual
+            scope = reservation['scope']
+            used, cap = self.used[scope], self.plan[scope]
+            delta = actual - reservation['tokens']
+            output_delta = max(0, output - reservation['output'])
+            # Reported usage has already been incurred, including any overrun.
+            used['tokens'] += delta
+            used['output'] += output_delta
+            within = all(used[key] <= cap[key] for key in cap)
+            adjustment = None
+            if delta > 0 or output_delta:
+                adjustment = {'scope': scope, 'reserved_tokens': reservation['tokens'],
+                              'reported_tokens': actual, 'token_delta': delta,
+                              'reserved_output_tokens': reservation['output'],
+                              'reported_output_tokens': output,
+                              'within_allocation': within, 'charged_after': dict(used)}
+                self.usage_adjustments.append(adjustment)
+            if not within:
+                raise ValueError('Preallocated ' + scope + ' resource budget exhausted by reported provider usage')
+            return adjustment
 
     def ledger(self):
         with self.lock:
             return {'limits': dict(self.limits), 'allocations': self.plan,
                     'charged': {name: dict(values) for name, values in self.used.items()},
-                    'token_accounting': 'provider total_tokens when reported; otherwise UTF-8 request bytes + 8192 framing + reserved output; output reservations are not refunded'}
+                    'usage_adjustments': [dict(item) for item in self.usage_adjustments],
+                    'token_accounting': 'provider total_tokens when reported, including above-estimate usage; otherwise UTF-8 request bytes + 8192 framing + reserved output; output reservations are not refunded; scope caps are never shared'}

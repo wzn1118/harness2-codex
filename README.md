@@ -43,3 +43,7 @@ codex plugin list
 此集成属于社区维护项目，未获得 Google 或 OpenAI 官方背书，也不修改 Codex UI/可执行文件。当前为 Linux
 实验版；上游来源、验证记录与已知限制见
 [集成审计](plugins/harness2-codex/docs/INTEGRATION_AUDIT.md)。
+
+A6API 实测现已完成[累计验收 40/40](plugins/harness2-codex/docs/RECOVERY_2026-10-23.md)：
+保留原 28 条通过，补齐固定 12 条故障项，三轮 84 条历史记录均保留。这证明累计执行恢复，
+不等于单轮无故障或性能提升；真实 PPC 保留原 harness，没有应用项目修改。
