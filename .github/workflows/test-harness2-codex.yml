@@ -30,3 +30,18 @@ jobs:
           python3 evaluation/no-docker-testkit/testkit.py preflight
           python3 evaluation/no-docker-testkit/testkit.py offline
           python3 evaluation/no-docker-testkit/testkit.py ab --tasks discount,slug --repeats 1
+
+  harnesspilot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install namespace test dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+      - name: Run HarnessPilot and pinned upstream suites
+        working-directory: plugins/harnesspilot
+        run: bash scripts/test.sh

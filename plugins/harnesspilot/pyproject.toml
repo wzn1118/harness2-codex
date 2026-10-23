@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "harnesspilot"
+version = "0.2.0a1"
+description = "Codex 原生的 Harness² 实验、独立验证与可回滚部署"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = "Apache-2.0"
+dependencies = ["mcp==1.30.0", "PyYAML==6.0.3", "tomlkit==0.13.3"]
+
+[project.scripts]
+harnesspilot = "harnesspilot.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["harnesspilot*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["upstream"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
