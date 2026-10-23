@@ -15,7 +15,7 @@ JOB_LOCK=threading.RLock()
 PROTOCOL_STDOUT=sys.stdout
 
 def validate_request(a):
-    allowed={"project_root","task","k","mode","check_argv","validation_tasks","validation_repeats","check_timeout_sec","max_requests","max_output_tokens","max_total_tokens","execution_timeout_sec","validate_unchanged","prices"}
+    allowed={"project_root","task","model_provider","model","k","mode","check_argv","validation_tasks","validation_repeats","check_timeout_sec","max_requests","max_output_tokens","max_total_tokens","execution_timeout_sec","validate_unchanged","prices"}
     if set(a)-allowed:raise ValueError("Unknown experiment arguments: "+str(sorted(set(a)-allowed)))
     for key in ("project_root","task"):
         if not a.get(key):raise ValueError(key+" is required")
@@ -25,6 +25,8 @@ def validate_request(a):
     if root==Path(root.anchor):raise ValueError("Cannot optimize an entire filesystem")
     if not isinstance(a["task"],str) or len(a["task"])>30000:raise ValueError("Task must be text <=30000 chars")
     if not a["task"].strip():raise ValueError("Task must not be blank")
+    if "model_provider" in a and (not isinstance(a["model_provider"],str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}",a["model_provider"])):raise ValueError("model_provider must name a configured Codex provider")
+    if "model" in a and (not isinstance(a["model"],str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}",a["model"])):raise ValueError("model must be a valid model-catalog identifier")
     def validate_argv(argv):
         if not isinstance(argv,list) or not argv or any(not isinstance(x,str) or not x for x in argv):raise ValueError("check_argv must be a nonempty argument array")
         if not argv[0].startswith("/usr/bin/"):raise ValueError("Validation executable must be an absolute /usr/bin/ path; use python3/node/bash with explicit script arguments")
@@ -85,19 +87,19 @@ def start(a):
     limits,plan=allocation(request)
     if not minimum_session_budget_ok(plan):raise ValueError("Budget too small for this held-out suite: each validation arm needs at least 4 requests, 16,384 output tokens and 100,000 total tokens. Call harness2_estimate_budget and raise explicit limits before spending.")
     from .runtime import host_config,binary_path
-    cfg=host_config();binary_path()
+    cfg=host_config(request.get("model_provider"),request.get("model"));binary_path()
     with JOB_LOCK:
         if any(x["thread"].is_alive() for x in JOBS.values()):raise ValueError("One active experiment per server; inspect or cancel it before starting another")
         run_id=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")+"-"+secrets.token_hex(6)
         run=C.runpath(run_id);run.mkdir(mode=0o700)
         C.atomic(run/"request.json",request)
-        C.atomic(run/"status.json",{"status":"running","run_id":run_id,"model":cfg["model"],"created_at":C.stamp()})
+        C.atomic(run/"status.json",{"status":"running","run_id":run_id,"model_provider":cfg["model_provider"],"provider_host":cfg["provider_host"],"model":cfg["model"],"created_at":C.stamp()})
         cancel=threading.Event()
         def worker():
             from .engine import experiment,ENGINE_LOCK
             try:
                 with ENGINE_LOCK:report=experiment(run,request,cancel)
-                C.atomic(run/"status.json",{"status":report["status"],"run_id":run_id})
+                C.atomic(run/"status.json",{"status":report["status"],"run_id":run_id,"model_provider":cfg["model_provider"],"provider_host":cfg["provider_host"],"model":cfg["model"]})
             except Exception as exc:
                 C.event(run,"failed",error=str(exc))
                 status="cancelled" if cancel.is_set() else "failed"
@@ -107,7 +109,7 @@ def start(a):
                 C.atomic(run/"status.json",failure|{"error":str(exc)})
         thread=threading.Thread(target=worker,daemon=True)
         JOBS[run_id]={"thread":thread,"cancel":cancel};thread.start()
-    return {"run_id":run_id,"status":"running","model":cfg["model"],"upstream_commit":C.COMMIT,"budget_limits":limits,"resource_plan":plan,"note":"Real isolated model executions started. No project modifications. Poll harness2_status; apply always needs a native user confirmation."}
+    return {"run_id":run_id,"status":"running","model_provider":cfg["model_provider"],"provider_host":cfg["provider_host"],"model":cfg["model"],"upstream_commit":C.COMMIT,"budget_limits":limits,"resource_plan":plan,"note":"Real isolated model executions started. No project modifications. Poll harness2_status; apply always needs a native user confirmation."}
 
 def call(name,a):
     if name=="harness2_inspect":
@@ -116,7 +118,7 @@ def call(name,a):
         test_files=[name for name in sorted(files) if any(part in {"test","tests","__tests__","verifier","verifiers"} for part in Path(name).parts) or Path(name).name.startswith(("test_","check_")) or Path(name).name.endswith("_test.py")]
         from .runtime import host_config
         try:
-            cfg=host_config();runtime={"ready":True,"model":cfg["model"],"sandbox_mode":cfg["sandbox_mode"],"approval_policy":cfg["approval_policy"]}
+            cfg=host_config(a.get("model_provider"),a.get("model"));runtime={"ready":True,"model_provider":cfg["model_provider"],"provider_host":cfg["provider_host"],"model":cfg["model"],"sandbox_mode":cfg["sandbox_mode"],"approval_policy":cfg["approval_policy"]}
         except Exception as exc:runtime={"ready":False,"reason":str(exc)}
         return {"project_root":str(root),"supported_surface":sorted(surface),"policy":"Additive AGENTS/Skills only; tool booleans and bounded effort/timeout; no user/global config or MCP command changes","file_count":len(files),"candidate_test_files":test_files[:100],"test_discovery_note":"Filename-only discovery; no test code was executed. Review and supply trusted held-out check_argv plus protected_paths.","upstream_commit":C.COMMIT,"check_required":"Supply trusted validation_tasks for effect claims; a legacy check_argv is exploratory only","namespace_sandbox":guard.available(),"runtime":runtime,"native_confirmation_display_configured":bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")),"headless_note":"No GUI means no apply/rollback; no confirmation bypass exists"}
     if name=="harness2_run":return start(a)
@@ -175,11 +177,11 @@ def call(name,a):
 def schema(properties,required=()):return {"type":"object","properties":properties,"required":list(required),"additionalProperties":False}
 STRING={"type":"string"}
 VALIDATION_TASK={"type":"object","properties":{"task_id":{"type":"string","pattern":"^[a-z0-9][a-z0-9_-]{0,49}$"},"family":STRING,"task":STRING,"check_argv":{"type":"array","items":STRING,"minItems":1},"protected_paths":{"type":"array","items":STRING,"minItems":1}},"required":["task_id","family","task","check_argv","protected_paths"],"additionalProperties":False}
-RUN_SCHEMA=schema({"project_root":STRING,"task":STRING,"check_argv":{"type":"array","items":STRING,"minItems":1},"validation_tasks":{"type":"array","items":VALIDATION_TASK,"minItems":10,"maxItems":50},"k":{"type":"integer","minimum":1,"maximum":3},"mode":{"type":"string","enum":["parallel","sequential"]},"validation_repeats":{"type":"integer","minimum":2,"maximum":5},"check_timeout_sec":{"type":"integer","minimum":5,"maximum":600},"max_requests":{"type":"integer","minimum":8,"maximum":1000},"max_output_tokens":{"type":"integer","minimum":8192,"maximum":4096000},"max_total_tokens":{"type":"integer","minimum":100000,"maximum":50000000},"execution_timeout_sec":{"type":"integer","minimum":30,"maximum":600},"prices":schema({"input_per_million":{"type":"number","minimum":0},"output_per_million":{"type":"number","minimum":0}},["input_per_million","output_per_million"]),"validate_unchanged":{"type":"boolean"}},["project_root","task"])
+RUN_SCHEMA=schema({"project_root":STRING,"task":STRING,"model_provider":{"type":"string","pattern":"^[A-Za-z0-9_.-]{1,64}$"},"model":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$"},"check_argv":{"type":"array","items":STRING,"minItems":1},"validation_tasks":{"type":"array","items":VALIDATION_TASK,"minItems":10,"maxItems":50},"k":{"type":"integer","minimum":1,"maximum":3},"mode":{"type":"string","enum":["parallel","sequential"]},"validation_repeats":{"type":"integer","minimum":2,"maximum":5},"check_timeout_sec":{"type":"integer","minimum":5,"maximum":600},"max_requests":{"type":"integer","minimum":8,"maximum":1000},"max_output_tokens":{"type":"integer","minimum":8192,"maximum":4096000},"max_total_tokens":{"type":"integer","minimum":100000,"maximum":50000000},"execution_timeout_sec":{"type":"integer","minimum":30,"maximum":600},"prices":schema({"input_per_million":{"type":"number","minimum":0},"output_per_million":{"type":"number","minimum":0}},["input_per_million","output_per_million"]),"validate_unchanged":{"type":"boolean"}},["project_root","task"])
 TOOLS=[
- {"name":"harness2_inspect","description":"Inspect supported project harness components and OS sandbox prerequisites without editing the project.","inputSchema":schema({"project_root":STRING},["project_root"]),"annotations":{"readOnlyHint":True}},
+ {"name":"harness2_inspect","description":"Inspect supported project harness components, sandbox prerequisites and an optional configured Codex provider/model without editing the project.","inputSchema":schema({"project_root":STRING,"model_provider":{"type":"string","pattern":"^[A-Za-z0-9_.-]{1,64}$"},"model":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$"}},["project_root"]),"annotations":{"readOnlyHint":True}},
  {"name":"harness2_estimate_budget","description":"Estimate preallocated request/output/token ceilings before any model calls. This is not a dollar quote.","inputSchema":schema({"validation_task_count":{"type":"integer","minimum":1,"maximum":50},"validation_repeats":{"type":"integer","minimum":2,"maximum":5},"max_requests":{"type":"integer","minimum":8,"maximum":1000},"max_output_tokens":{"type":"integer","minimum":8192,"maximum":4096000},"max_total_tokens":{"type":"integer","minimum":100000,"maximum":50000000}}),"annotations":{"readOnlyHint":True}},
- {"name":"harness2_run","description":"Start actual pinned Harness2 PPC then independently evaluate a hidden multi-task hold-out suite. Costs API tokens. No project changes. Never simulate missing stages.","inputSchema":RUN_SCHEMA,"annotations":{"readOnlyHint":False,"openWorldHint":True}},
+ {"name":"harness2_run","description":"Start actual pinned Harness2 PPC using the active or explicitly selected configured Codex provider/model, then independently evaluate a hidden multi-task hold-out suite. Costs API tokens. No project changes. Never simulate missing stages.","inputSchema":RUN_SCHEMA,"annotations":{"readOnlyHint":False,"openWorldHint":True}},
  {"name":"harness2_status","description":"Read progress, actual execution audit, verification contrasts, diff and costs.","inputSchema":schema({"run_id":STRING}),"annotations":{"readOnlyHint":True}},
  {"name":"harness2_get_report","description":"Read and integrity-check the complete signed report for a finished experiment.","inputSchema":schema({"run_id":STRING},["run_id"]),"annotations":{"readOnlyHint":True}},
  {"name":"harness2_preview_apply","description":"Read-only drift and deployment eligibility check with the exact diff; does not write files or open confirmation.","inputSchema":schema({"run_id":STRING},["run_id"]),"annotations":{"readOnlyHint":True}},

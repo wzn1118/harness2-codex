@@ -37,7 +37,10 @@ not a Google Research or OpenAI product.
 - Project policy that cannot be faithfully inherited, unsupported Codex
   permission profiles, missing namespace prerequisites and unsupported
   providers fail closed. The current broker requires an API-key-backed
-  Responses provider; ChatGPT OAuth-only authentication is unsupported.
+  Responses provider; ChatGPT OAuth-only authentication is unsupported. Runs
+  may select only a provider already configured in Codex; model overrides must
+  be present in the configured model catalog. An optional key file is accepted
+  only when absolute, regular, owned by the Codex user and mode 0600 or stricter.
 - Confirmatory validation accepts caller-defined task prompts and verifier
   commands. Declared verifier files are withheld from every model worker and
   restored only in the separate checker workspace. At least 10 caller-declared
@@ -59,12 +62,18 @@ not a Google Research or OpenAI product.
   that material. Token reservations are enforced, but unavailable provider usage
   cannot be independently verified and there is no hard dollar cap. USD cost is
   not estimated without caller-supplied prices.
+- Codex worker `error`, `turn.failed` and `response.failed` JSONL events are
+  retained as sanitized diagnostics and invalidate affected comparisons.
+  Request IDs are extracted without inventing HTTP statuses. Provider request
+  counts and responses with usage are reported separately; missing usage is
+  explicit.
 
 ## Verification and Actual Runs
 
 Validated on 2026-10-22/23:
 
-- Plugin safety/integration tests: 32 passed, including family-bootstrap
+- Plugin safety/integration tests: 37 passed, including A6API profile/key-file
+  selection, stream-disconnect diagnostics, family-bootstrap
   classification, budget estimates, hidden-verifier isolation and read-only
   deployment preview. All 10 synthetic effect-benchmark verifiers reject the
   deliberately buggy baseline; this validates fixtures, not optimizer quality.
@@ -94,16 +103,24 @@ Validated on 2026-10-22/23:
   read-only connectivity probe succeeded with 14,103 reported tokens, but is
   not Harness² evidence. Combined budget accounting for these two runs and the
   probe was 6,395,170 tokens. No files were applied.
+- A later real A6API + `gpt-6.1-sol` run completed PPC candidate selection and
+  five single-task hold-out pairs. Raw success was 1/5 baseline versus 3/5
+  candidate, but the signed report correctly classified the comparison as
+  `validation_inconclusive`, not an improvement. The retained Codex JSONL shows
+  `stream disconnected before completion` with a request ID; no HTTP status can
+  be verified from that event. The old provider-error ledger missed this worker
+  stream error, and usage was incomplete (1,864,342 tokens recorded; USD
+  unknown). The source project was unchanged and no candidate was applied.
+  This finding led to the worker-error audit, missing-usage counters and
+  explicit per-row invalidation reasons now covered by tests.
 - No experiment diff was applied. USD costs are unknown because provider rates
   were not supplied. Ordinary test success and partial A/A observations do not
   establish Harness² improvement on a project.
-- The older successful/partial model runs above used the prior single-task
-  protocol. The two newer runs used the protected multi-family protocol but
-  failed before candidate selection and held-out evaluation. There is therefore
-  no valid measured effect conclusion under the upgraded evaluator: neither a
-  positive effect nor a zero/no-effect result has been established. Provider
-  failures are now explicitly classified as optimization-inconclusive by the
-  current source.
+- The older successful/partial model runs used the prior single-task protocol;
+  the two multi-family runs failed before candidate selection, while the A6API
+  single-task run had an upstream stream failure and an invalid paired
+  comparison. There is therefore no valid measured effect conclusion: neither
+  a positive effect nor a zero/no-effect result has been established.
 
 These outcomes are intentionally reported as no valid measured improvement.
 Run-specific event logs, absolute project paths, identifiers and private

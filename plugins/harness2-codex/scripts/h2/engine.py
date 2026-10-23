@@ -111,8 +111,28 @@ def summarize_validation(rows,repeats,tasks=None,*,candidate_unchanged=False):
         rows=[{**row,"task_id":row.get("task_id","primary")} for row in rows]
     expected={(task["task_id"],trial,arm) for task in tasks for trial in range(repeats) for arm in ("baseline","candidate")}
     actual=[(row.get("task_id"),row.get("trial"),row.get("kind")) for row in rows]
-    infrastructure_invalid=any(row.get("infrastructure_errors") or row.get("agent_stop_reason") or row.get("check",{}).get("stop_reason") or (row.get("agent_exit_code",0)!=0 and row.get("known_provider_usage",{}).get("responses_with_usage")==0) for row in rows)
-    valid=len(rows)==len(expected) and len(set(actual))==len(actual) and set(actual)==expected and not infrastructure_invalid
+    invalidation_reasons=[]
+    if len(rows)!=len(expected):
+        invalidation_reasons.append(f"expected {len(expected)} paired rows, observed {len(rows)}")
+    if len(set(actual))!=len(actual):
+        invalidation_reasons.append("duplicate task/trial/arm rows")
+    missing=sorted(expected-set(actual))
+    if missing:
+        invalidation_reasons.append("missing paired rows: "+", ".join("/".join(map(str,item)) for item in missing[:20]))
+    for row in rows:
+        label=f"{row.get('task_id')}/{row.get('trial')}/{row.get('kind')}"
+        for error in row.get("infrastructure_errors",[]):
+            invalidation_reasons.append(f"{label}: {str(error)[:1000]}")
+        if row.get("agent_stop_reason"):
+            invalidation_reasons.append(f"{label}: agent stopped: {row['agent_stop_reason']}")
+        if row.get("check",{}).get("stop_reason"):
+            invalidation_reasons.append(f"{label}: verifier stopped: {row['check']['stop_reason']}")
+        usage=row.get("known_provider_usage") or {}
+        if row.get("agent_exit_code",0)!=0 and usage.get("responses_with_usage",0)==0 and not row.get("infrastructure_errors"):
+            invalidation_reasons.append(
+                f"{label}: agent exit {row.get('agent_exit_code')} with no provider usage; failure cause unverified"
+            )
+    valid=not invalidation_reasons
     by_task={}
     for task in tasks:
         task_rows=[row for row in rows if row.get("task_id")==task["task_id"]]
@@ -145,7 +165,7 @@ def summarize_validation(rows,repeats,tasks=None,*,candidate_unchanged=False):
     elif interval["upper"]<0:conclusion="regression_supported"
     elif estimate==0:conclusion="no_detected_effect"
     else:conclusion="effect_inconclusive"
-    return {"rows":rows,"baseline_passed":baseline,"candidate_passed":candidate,"total_task_trials":len(tasks)*repeats,"repeats":repeats,"task_count":len(tasks),"family_count":len(family_lifts),"task_results":by_task,"family_success_lift":family_lifts,"success_lift":estimate,"success_lift_95_ci":interval,"comparison_valid":valid,"confirmatory_suite":confirmatory,"non_regression":valid and candidate==len(expected)//2 and candidate>=baseline and no_regressed_pair,"measured_success_gain":valid and candidate>baseline,"effect_conclusion":conclusion}
+    return {"rows":rows,"baseline_passed":baseline,"candidate_passed":candidate,"total_task_trials":len(tasks)*repeats,"repeats":repeats,"task_count":len(tasks),"family_count":len(family_lifts),"task_results":by_task,"family_success_lift":family_lifts,"success_lift":estimate,"success_lift_95_ci":interval,"comparison_valid":valid,"invalidation_reasons":invalidation_reasons,"confirmatory_suite":confirmatory,"non_regression":valid and candidate==len(expected)//2 and candidate>=baseline and no_regressed_pair,"measured_success_gain":valid and candidate>baseline,"effect_conclusion":conclusion}
 
 def verify_pair(adapter,selected,request,cancel):
     """Hold-out checks are never supplied to the proposer/composer/selector."""
@@ -171,7 +191,12 @@ def verify_pair(adapter,selected,request,cancel):
                 p=work/name
                 if not p.exists() or p.read_bytes()!=text.encode():forbidden.append(name)
             check=guard.check_command(work,task["check_argv"],timeout=request.get("check_timeout_sec",120),cancel=cancel,output=dest/"check.json")
-            rows.append({"task_id":task["task_id"],"family":task["family"],"trial":trial,"kind":kind,"check":check,"harness_mutations":forbidden,"agent_exit_code":result["exit_code"],"agent_stop_reason":result.get("stop_reason"),"infrastructure_errors":result.get("infrastructure_errors",[]),"agent_wall_s":result.get("wall_s"),"known_provider_usage":result.get("known_provider_usage"),"passed":check["exit_code"]==0 and result["exit_code"]==0 and not forbidden})
+            passed=check["exit_code"]==0 and result["exit_code"]==0 and not forbidden
+            failure_class=("infrastructure_error" if result.get("infrastructure_errors") or result.get("stop_reason") or check.get("stop_reason") else
+                           "agent_failure" if result["exit_code"]!=0 else
+                           "verifier_failure" if check["exit_code"]!=0 else
+                           "harness_mutation" if forbidden else "pass")
+            rows.append({"task_id":task["task_id"],"family":task["family"],"trial":trial,"kind":kind,"check":check,"failure_class":failure_class,"harness_mutations":forbidden,"agent_exit_code":result["exit_code"],"agent_stop_reason":result.get("stop_reason"),"infrastructure_errors":result.get("infrastructure_errors",[]),"agent_wall_s":result.get("wall_s"),"known_provider_usage":result.get("known_provider_usage"),"passed":passed})
             C.atomic(adapter.run/"holdout-results.json",rows)
             C.event(adapter.run,"holdout_check",result=rows[-1])
     changed_surface=any(selected.get(name)!=adapter.original.get(name) for name in set(selected)|set(adapter.original))
@@ -186,8 +211,10 @@ def re_test_path(name):
 
 def experiment(run,request,cancel):
     C.verify_upstream();guard.available()
-    cfg=host_config()
-    C.event(run,"preflight",upstream_commit=C.COMMIT,model=cfg["model"])
+    cfg=host_config(request.get("model_provider"),request.get("model"))
+    provider_name=cfg.get("model_provider","configured")
+    provider_host=cfg.get("provider_host","unknown")
+    C.event(run,"preflight",upstream_commit=C.COMMIT,model=cfg["model"],model_provider=provider_name,provider_host=provider_host)
     project=Path(request["project_root"]).resolve()
     P.check_policy_context(project)
     if C.STATE==project or C.STATE.is_relative_to(project):raise ValueError("State directory must be outside the project")
@@ -251,9 +278,9 @@ def experiment(run,request,cancel):
                      "valid_evaluation_without_supported_improvement" if validation and validation.get("comparison_valid") else
                      "evaluation_incomplete_or_invalid")
         eval_manifest=[{"task_id":task["task_id"],"family":task["family"],"prompt_sha256":C.digest(task["task"].encode()),"verifier_sha256":C.digest(C.canonical(task["check_argv"])),"protected_path_hashes":{name:manifest[name] for name in task.get("protected_paths",[])}} for task in request["validation_tasks"]]
-        report={"run_id":run.name,"status":status,"run_outcome":run_outcome,"ppc_infrastructure_failures":ppc_infrastructure_failures,"project_root":str(project),"model":cfg["model"],"upstream_commit":C.COMMIT,"method":result.to_dict(),"selection":chosen.to_dict(),"validation":validation,"evaluation_manifest":eval_manifest,"ledger":runtime.ledger(),"changed_files":sorted(changes),"diff":"".join(patch),"created_at":C.stamp(),"confirmation_token":secrets.token_urlsafe(24) if status=="awaiting_confirmation" else None,"experience":experience}
+        report={"run_id":run.name,"status":status,"run_outcome":run_outcome,"ppc_infrastructure_failures":ppc_infrastructure_failures,"project_root":str(project),"model_provider":provider_name,"provider_host":provider_host,"model":cfg["model"],"upstream_commit":C.COMMIT,"method":result.to_dict(),"selection":chosen.to_dict(),"validation":validation,"evaluation_manifest":eval_manifest,"ledger":runtime.ledger(),"changed_files":sorted(changes),"diff":"".join(patch),"created_at":C.stamp(),"confirmation_token":secrets.token_urlsafe(24) if status=="awaiting_confirmation" else None,"experience":experience}
         C.atomic(run/"report.json",C.seal(report))
-        C.atomic(run/"status.json",{"status":status,"run_id":run.name,"model":cfg["model"]})
+        C.atomic(run/"status.json",{"status":status,"run_id":run.name,"model_provider":provider_name,"provider_host":provider_host,"model":cfg["model"]})
         deployment={"report":report,"changes":C.encode_tree(changes),"before":C.encode_tree({n:original_files[n] for n in changes if n in original_files}),"snapshot_manifest":manifest,"selected_surface":selected,"experience":experience,"mode":mode}
         C.atomic(run/"deployment.json",C.seal(deployment))
         C.event(run,"experiment_complete",status=status)

@@ -11,6 +11,8 @@
         "PATH",
         "HOME",
         "HARNESS2_STATE_DIR",
+        "HARNESS2_PROVIDER_API_KEY",
+        "HARNESS2_PROVIDER_API_KEY_FILE",
         "DISPLAY",
         "XAUTHORITY",
         "WAYLAND_DISPLAY",
