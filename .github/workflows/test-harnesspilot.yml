@@ -20,7 +20,6 @@ jobs:
         working-directory: plugins/harnesspilot
         run: |
           sudo systemd-run --system --pipe --wait --collect --quiet \
-            --uid="$(id -u)" --gid="$(id -g)" \
             --property=Delegate=yes \
             --property=CPUAccounting=yes \
             --property=MemoryAccounting=yes \
