@@ -123,6 +123,14 @@ plus 8192 framing tokens and output before dispatch, then reconcile to actual
 provider usage. Unknown usage keeps the conservative reservation. Unreported
 provider-internal tokenization cannot be independently guaranteed by the
 client; unexpected usage beyond reservation invalidates the execution.
+The first provider request in a run is single-flight; after it succeeds, up to
+8 requests may be in flight. Any provider HTTP error or transport failure opens
+a per-run circuit breaker, so queued workers are rejected locally without
+another upstream call or budget reservation. Codex worker retries are disabled
+for the Responses provider. The audit ledger retains sanitized provider status,
+host, request ID and numeric `Retry-After`; it never records response bodies or
+credentials. The failed upstream request keeps its conservative reservation
+because reported usage is unknown.
 Optional `execution_timeout_sec` applies the same 30..600 second ceiling to
 every session; when set, it deliberately disables evaluation of candidate
 timeout changes, without changing any permission policy. Timeout and

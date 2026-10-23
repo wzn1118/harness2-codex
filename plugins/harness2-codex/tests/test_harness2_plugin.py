@@ -1,10 +1,15 @@
+import io
+import http.client
 import json
 import os
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import urllib.error
 import unittest
 from unittest.mock import patch
 
@@ -13,7 +18,7 @@ from h2 import common as C, project as P, guard
 from h2 import server
 from h2.deploy import deploy, rollback
 from h2.engine import ProjectAdapter, verify_pair, summarize_validation
-from h2.runtime import host_config, Runtime
+from h2.runtime import host_config, ProviderFailure, Runtime
 from h2.budget import Budget, allocation
 
 class SafetyTests(unittest.TestCase):
@@ -58,16 +63,72 @@ class SafetyTests(unittest.TestCase):
         run=self.state/'assets';run.mkdir(parents=True)
         cache=Path(self.temp.name)/'removable-cache'
         relay=cache/'scripts/h2/relay.py';relay.parent.mkdir(parents=True);relay.write_text('# fixture relay\n')
-        config={'model':'test-only','sandbox_mode':'workspace-write','approval_policy':'on-request'}
+        config={'model':'test-only','base_url':'https://provider.invalid','key':'fixture-only','sandbox_mode':'workspace-write','approval_policy':'on-request'}
         with patch('h2.runtime.ROOT',cache),patch('h2.runtime.binary_path',return_value=Path('/usr/bin/true')):
             runtime=Runtime(run,threading.Event(),config)
         try:
             shutil.rmtree(cache)
             self.assertEqual(runtime.relay.read_text(),'# fixture relay\n')
             failure={'exit_code':1,'wall_s':0.01,'stop_reason':None,'stderr':'launcher fixture failure','stdout':''}
-            with patch('h2.runtime.guard.process',return_value=failure):
+            def inspect_worker_config(cmd,**kwargs):
+                target=cmd.index('/home/worker/config.toml')
+                worker_config=Path(cmd[target-1]).read_text()
+                self.assertIn('request_max_retries = 0',worker_config)
+                self.assertIn('stream_max_retries = 0',worker_config)
+                return failure
+            with patch('h2.runtime.guard.process',side_effect=inspect_worker_config):
                 result=runtime.call(self.root,'fixture','holdout-0-baseline')
             self.assertIn('before any provider request',result['infrastructure_errors'][0])
+        finally:runtime.close()
+    def test_provider_502_opens_circuit_once_and_records_safe_diagnostics(self):
+        run=self.state/'provider-circuit';run.mkdir(parents=True)
+        config={'model':'fixture-model','base_url':'https://provider.invalid','key':'never-log-this',
+                'sandbox_mode':'read-only','approval_policy':'on-request'}
+        with patch('h2.runtime.binary_path',return_value=Path('/usr/bin/true')):
+            runtime=Runtime(run,threading.Event(),config)
+        def upstream_502(*args,**kwargs):
+            headers=io.BytesIO(b'{"error":{"message":"temporary outage"}}')
+            response_headers={'x-request-id':'provider-req-123','Retry-After':'17'}
+            raise urllib.error.HTTPError(
+                'https://provider.invalid/responses',502,'Bad Gateway',response_headers,headers)
+        barrier=threading.Barrier(2)
+        def call(label):
+            barrier.wait()
+            try:
+                runtime.forward(label,{'model':'fixture-model','input':'short probe'},'application/json')
+            except ProviderFailure as exc:
+                return exc
+            self.fail('mock provider failure unexpectedly succeeded')
+        try:
+            with patch('h2.runtime.urllib.request.urlopen',side_effect=upstream_502) as upstream:
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    errors=list(executor.map(call,('roll-first','roll-second')))
+                self.assertEqual(upstream.call_count,1)
+            self.assertEqual({error.status for error in errors},{502})
+            self.assertTrue(any('circuit opened' in str(error) for error in errors))
+            self.assertTrue(any('Provider circuit open' in str(error) for error in errors))
+            self.assertTrue(all('never-log-this' not in str(error) for error in errors))
+            with runtime.lock:
+                runtime.tokens['proxy-fixture-token']='roll-proxy'
+            connection=http.client.HTTPConnection('localhost')
+            connection.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+            connection.sock.connect(runtime.server.server_address)
+            connection.request('POST','/responses',body=json.dumps({'model':'fixture-model','input':'probe'}),
+                               headers={'Authorization':'Bearer proxy-fixture-token','Content-Type':'application/json'})
+            response=connection.getresponse()
+            error_body=json.loads(response.read())
+            connection.close()
+            self.assertEqual(response.status,502)
+            self.assertEqual(error_body['error']['type'],'upstream_error')
+            self.assertIn('provider-req-123',error_body['error']['message'])
+            self.assertNotIn('temporary outage',json.dumps(error_body))
+            ledger=runtime.ledger()
+            self.assertEqual(ledger['provider_requests'],1)
+            self.assertEqual(ledger['provider_errors'][0]['request_id'],'provider-req-123')
+            self.assertEqual(ledger['provider_errors'][1]['blocked'],True)
+            self.assertNotIn('temporary outage',json.dumps(ledger))
+            self.assertNotIn('never-log-this',json.dumps(ledger))
+            self.assertEqual(runtime.budget.ledger()['charged']['optimization']['requests'],1)
         finally:runtime.close()
     def test_task_diff_excludes_prematerialized_harness(self):
         run=self.state/'clean-deliverable';run.mkdir(parents=True)
