@@ -1,0 +1,27 @@
+{
+  "name": "harnesspilot",
+  "version": "0.2.0-alpha.1",
+  "description": "Run the complete Harness2 experiment workflow from Codex with independent validation and review-gated apply or rollback.",
+  "author": { "name": "wzn1118", "url": "https://github.com/wzn1118" },
+  "homepage": "https://github.com/wzn1118/harness2-codex/tree/main/plugins/harnesspilot",
+  "repository": "https://github.com/wzn1118/harness2-codex",
+  "license": "Apache-2.0",
+  "keywords": ["harness2", "codex", "optimization", "experiments", "validation", "mcp"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "HarnessPilot",
+    "shortDescription": "Run reviewable Harness2 experiments in Codex",
+    "longDescription": "A local Codex integration for Harness2 project inspection, budgeted baseline and recursive experiments, independent validation, reports, and approval-gated apply or rollback.",
+    "developerName": "wzn1118",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "websiteURL": "https://github.com/wzn1118/harness2-codex/tree/main/plugins/harnesspilot",
+    "defaultPrompt": [
+      "Inspect this project with HarnessPilot.",
+      "Estimate a Harness2 baseline experiment.",
+      "Review the latest HarnessPilot experiment."
+    ],
+    "brandColor": "#4285F4"
+  }
+}

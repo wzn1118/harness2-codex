@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "harnesspilot": {
+      "command": "C:\\Windows\\System32\\wsl.exe",
+      "args": [
+        "--distribution", "Ubuntu", "--user", "root", "--exec",
+        "/usr/bin/systemd-run", "--system", "--pipe", "--wait", "--collect", "--quiet",
+        "--uid=harnesspilot", "--property=Delegate=yes", "--property=CPUAccounting=yes",
+        "--property=MemoryAccounting=yes", "--property=TasksAccounting=yes",
+        "--property=CPUQuota=200%", "--property=MemoryMax=2147483648",
+        "--property=MemorySwapMax=0", "--property=TasksMax=96",
+        "--setenv=PYTHONPATH=/opt/harnesspilot/app/upstream:/opt/harnesspilot/app",
+        "--setenv=HARNESSPILOT_CODEX_BIN=/opt/harnesspilot/codex-cli/node_modules/.bin/codex",
+        "--setenv=HARNESSPILOT_CODEX_ROOT=/opt/harnesspilot/codex-cli",
+        "--setenv=HARNESSPILOT_CODEX_HOME=/home/harnesspilot/.codex",
+        "--setenv=HARNESSPILOT_STATE=/var/lib/harnesspilot/state",
+        "--setenv=PYTHONUNBUFFERED=1", "--",
+        "/opt/harnesspilot/.venv/bin/python", "-m", "harnesspilot.server"
+      ]
+    }
+  }
+}
