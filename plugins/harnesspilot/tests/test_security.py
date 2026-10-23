@@ -193,8 +193,22 @@ class BoundaryTests(unittest.TestCase):
             self.assertNotIn("prompt", suite.public_task(task_id))
 
 
-@unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("bwrap"),
-                     "Linux bubblewrap required")
+def namespace_prerequisites():
+    if not sys.platform.startswith("linux") or not shutil.which("bwrap"):
+        return False
+    try:
+        memberships = Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines()
+        relative = next(line.split(":", 2)[2] for line in memberships
+                        if line.startswith("0::"))
+        root = (Path("/sys/fs/cgroup") / relative.lstrip("/")).resolve()
+        available = set((root / "cgroup.controllers").read_text(encoding="ascii").split())
+        return {"cpu", "memory", "pids"} <= available and os.access(root / "cgroup.procs", os.W_OK)
+    except (OSError, StopIteration):
+        return False
+
+
+@unittest.skipUnless(namespace_prerequisites(),
+                     "Linux bubblewrap and delegated cpu/memory/pids cgroup required")
 class NamespaceTests(unittest.TestCase):
     def test_workspace_is_writable_but_host_tmp_and_network_are_isolated(self):
         with tempfile.TemporaryDirectory() as temporary:

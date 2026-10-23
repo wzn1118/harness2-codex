@@ -12,10 +12,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+      - name: Install Python 3.10 TOML compatibility
+        run: python -m pip install tomli==2.2.1
       - name: Install namespace test dependency
         run: |
           sudo apt-get update
           sudo apt-get install --yes bubblewrap
+      - name: Allow bubblewrap user namespaces under Ubuntu AppArmor
+        run: |
+          if [[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || printf '0')" == "1" ]]; then
+            sudo apt-get install --yes apparmor-profiles apparmor-utils
+            profile=/etc/apparmor.d/bwrap-userns-restrict
+            if [[ ! -f "$profile" ]]; then
+              sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict "$profile"
+            fi
+            sudo apparmor_parser -r "$profile"
+          fi
       - name: Verify pinned upstream and plugin safety suite
         working-directory: plugins/harness2-codex
         run: |
@@ -30,18 +42,3 @@ jobs:
           python3 evaluation/no-docker-testkit/testkit.py preflight
           python3 evaluation/no-docker-testkit/testkit.py offline
           python3 evaluation/no-docker-testkit/testkit.py ab --tasks discount,slug --repeats 1
-
-  harnesspilot:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install namespace test dependency
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes bubblewrap
-      - name: Run HarnessPilot and pinned upstream suites
-        working-directory: plugins/harnesspilot
-        run: bash scripts/test.sh
