@@ -1,0 +1,44 @@
+name: HarnessPilot tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+      - name: Allow bubblewrap user namespaces under Ubuntu AppArmor
+        run: |
+          if [[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || printf '0')" == "1" ]]; then
+            sudo apt-get install --yes apparmor-profiles apparmor-utils
+            profile=/etc/apparmor.d/bwrap-userns-restrict
+            if [[ ! -f "$profile" ]]; then
+              sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict "$profile"
+            fi
+            sudo apparmor_parser -r "$profile"
+          fi
+      - name: Install test packages and run isolated suites
+        working-directory: plugins/harnesspilot
+        run: |
+          sudo systemd-run --system --pipe --wait --collect --quiet \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            --property=Delegate=yes \
+            --property=CPUAccounting=yes \
+            --property=MemoryAccounting=yes \
+            --property=TasksAccounting=yes \
+            --property=CPUQuota=200% \
+            --property=MemoryMax=2147483648 \
+            --property=MemorySwapMax=0 \
+            --property=TasksMax=96 \
+            --property="WorkingDirectory=$GITHUB_WORKSPACE/plugins/harnesspilot" \
+            --setenv="PATH=$PATH" \
+            -- /bin/bash -lc 'python -m pip install --disable-pip-version-check -e . -e upstream && bash scripts/test.sh'
