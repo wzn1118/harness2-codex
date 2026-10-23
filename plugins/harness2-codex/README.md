@@ -55,6 +55,10 @@ Chat example:
 
 The chat must supply the **explicit absolute project path**, optimization task,
 and either a legacy `check_argv` or a multi-task `validation_tasks` suite. For
+the top-level `task`, supply a concrete representative project task that the
+rollout worker can execute, not "run Harness2" or "optimize AGENTS.md". Only
+upstream proposer/composer sessions edit candidate harnesses; rollout workers
+solve the project task under each harness. For
 effect claims, use at least 10 caller-declared task families with distinct,
 protected verifier files. Verifier files are withheld from every model session
 and restored only for the independent check. Two paired trials in alternating
@@ -145,15 +149,28 @@ stay with optimization. This prevents a late baseline from being starved by
 earlier candidate or optimization calls. Per-request output reservations are capped
 at 4096 and are not refunded. Total tokens reserve client request UTF-8 bytes
 plus 8192 framing tokens and output before dispatch, then reconcile to actual
-provider usage. Unknown usage keeps the conservative reservation. Unreported
-provider-internal tokenization cannot be independently guaranteed by the
-client; unexpected usage beyond reservation invalidates the execution.
+provider usage. Unknown usage keeps the conservative reservation. Reported
+usage above a single-request estimate is charged in full and may continue
+within that session's original allocation. Reported usage beyond the session
+allocation is also charged in full, but stops further spending; another arm's
+quota is never borrowed. The ledger records each above-estimate adjustment.
+Unreported provider-internal tokenization cannot be independently guaranteed
+by the client.
 The first provider request in a run is single-flight; after it succeeds, up to
-8 requests may be in flight. Any provider HTTP error or transport failure opens
-a per-run circuit breaker, so queued workers are rejected locally without
-another upstream call or budget reservation. Codex worker retries are disabled
-for the Responses provider. The audit ledger retains sanitized provider status,
-host, request ID and numeric `Retry-After`; it never records response bodies or
+8 requests may be in flight. HTTP 502/503/504 may receive up to two broker
+retries; a truncated `IncompleteRead` receives one. Exhausted transient
+failures open the per-run circuit to fail fast during the affected worker. A
+fresh isolated-session retry or subsequent independent session may probe again
+after an HTTP 502/503/504 circuit or an explicit `upstream_unavailable` provider
+error. The failed session remains bounded, and every reset and retry stays in
+the audit ledger. Ordinary authentication and quota errors remain blocking;
+they cannot use the transient reset. A
+Codex worker stream disconnect, transient provider
+error, or execution timeout may receive up to two fresh, isolated-session
+retries in PPC, rollout, or a holdout arm. Retries use the same resource
+allocation as the failed call; every attempt and recovery status remain
+auditable. Backoff increases between attempts. The audit retains sanitized provider status, host,
+request ID and numeric `Retry-After`; it never records response bodies or
 credentials. The failed upstream request keeps its conservative reservation
 because reported usage is unknown.
 Optional `execution_timeout_sec` applies the same 30..600 second ceiling to
@@ -189,3 +206,9 @@ See `vendor/harness2-upstream/PROVENANCE.json`, upstream `LICENSE`, and
 The deterministic no-Docker judge smoke test is documented in
 `evaluation/no-docker-testkit/README.md`. It makes no model calls and is not an
 optimization-effect benchmark.
+
+The live A6API recovery acceptance is documented in
+[`docs/RECOVERY_2026-10-23.md`](docs/RECOVERY_2026-10-23.md): cumulative
+40/40 (28 retained passes plus 12 recovered rows), with all 84 source records
+retained privately. This is not a fault-free single run or an optimization
+gain: real PPC selected an unchanged harness, and no project changes were applied.

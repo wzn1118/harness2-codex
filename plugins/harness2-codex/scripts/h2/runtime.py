@@ -2,6 +2,7 @@
 from __future__ import annotations
 import http.server
 import http.client
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,8 @@ except ImportError:
 from . import guard
 from .budget import Budget, allocation
 from .common import ROOT, atomic, event, stamp
+
+MAX_PROVIDER_RETRIES = 2
 
 def _provider_request_id(headers):
     if headers is None:
@@ -133,17 +136,23 @@ def extract_codex_errors(path, secret=""):
     return errors
 
 class ProviderFailure(RuntimeError):
-    def __init__(self, status, host, request_id=None, retry_after=None, *, circuit_open=False, transport=None):
+    def __init__(self, status, host, request_id=None, retry_after=None, *, circuit_open=False, transport=None, detail=None, retryable=False, transient_code=None):
         self.status = status
         self.host = host
         self.request_id = request_id
         self.retry_after = retry_after
         self.circuit_open = circuit_open
         self.transport = transport
+        self.detail = detail
+        self.retryable = retryable
+        self.transient_code = transient_code
         if circuit_open:
-            message = f"Provider circuit open after HTTP {status} from {host}"
+            message = (f"Provider circuit open after transient {transient_code} (HTTP {status}) from {host}"
+                       if transient_code else f"Provider circuit open after HTTP {status} from {host}")
         elif transport:
             message = f"Provider transport failure ({transport}) to {host}"
+        elif transient_code:
+            message = f"Transient upstream provider error {transient_code} (HTTP {status}) from {host}"
         else:
             message = f"Upstream provider HTTP {status} from {host}"
         if request_id:
@@ -155,16 +164,31 @@ class ProviderFailure(RuntimeError):
         super().__init__(message)
 
     def as_record(self, label):
-        return {"label": label, "status": self.status, "provider_host": self.host,
+        record={"label": label, "status": self.status, "provider_host": self.host,
                 "request_id": self.request_id, "retry_after": self.retry_after,
-                "circuit_open": self.circuit_open,
+                "circuit_open": self.circuit_open,"retryable":self.retryable,
                 "status_origin": "local_transport_mapping" if self.transport else "provider_http"}
+        if self.transient_code:
+            record["transient_code"]=self.transient_code
+        if self.detail:
+            record["detail"]=self.detail
+        return record
 
 def host_config(model_provider=None, model=None):
     home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
     for path in (home/"requirements.toml",Path("/etc/codex/requirements.toml"),Path("/etc/codex/config.toml"),home/"AGENTS.md",home/"AGENTS.override.md"):
         if path.exists():raise ValueError("Additional host policy/instructions require explicit import; refusing to omit: "+str(path))
     config = tomllib.loads((home / "config.toml").read_text())
+    model_catalog = config.get("model_catalog_json")
+    if model_catalog is not None:
+        if not isinstance(model_catalog, str) or not model_catalog:
+            raise ValueError("Configured model catalog path must be nonempty text")
+        catalog_path = Path(model_catalog).expanduser()
+        if not catalog_path.is_absolute():
+            catalog_path = home / catalog_path
+        if not catalog_path.is_file():
+            raise ValueError("Configured model catalog cannot be read")
+        model_catalog = str(catalog_path.resolve())
     # A separate executor cannot safely infer a selected desktop profile or
     # translate arbitrary named permission profiles. Refuse, never broaden.
     if any(config.get(k) for k in ("profile", "profiles", "permissions")):
@@ -217,7 +241,7 @@ def host_config(model_provider=None, model=None):
     return {"model": selected_model, "model_provider": provider_name,
             "provider_host": parsed_base.hostname, "base_url": base, "key": key,
             "sandbox_mode": sandbox, "approval_policy": config.get("approval_policy", "on-request"),
-            "codex_home":str(home),"tool_envelope":envelope}
+            "codex_home":str(home),"model_catalog_json":model_catalog,"tool_envelope":envelope}
 
 def binary_path():
     executable = Path(shutil.which("codex") or "/not-found").resolve()
@@ -243,6 +267,26 @@ def extract_usage(payload):
         if isinstance(usage,dict): candidates.append(usage)
     return candidates[-1] if candidates else None
 
+def _provider_error_detail(error, key):
+    try:
+        payload=json.loads(error.read(8192).decode("utf-8",errors="replace"))
+    except (OSError,ValueError,AttributeError):
+        return None,None
+    detail=payload.get("error") if isinstance(payload,dict) else None
+    if not isinstance(detail,dict):
+        return None,None
+    text=" ".join(str(detail[name]) for name in ("type","code","message","param")
+                  if detail.get(name) is not None)
+    if key:
+        text=text.replace(key,"[REDACTED]")
+    text=re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]", text)
+    text=re.sub(r"\b(?:sk|ak|rk)-[A-Za-z0-9_-]{16,}\b", "[REDACTED]", text)
+    text=" ".join(text.split())
+    code=detail.get("code")
+    if not isinstance(code,str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}",code):
+        code=None
+    return text[:500] or None,code
+
 class Runtime:
     def __init__(self, run, cancel, config, max_requests=160, max_output_tokens=655360, prices=None, budget_request=None, execution_timeout_sec=None):
         self.run, self.cancel, self.config = run, cancel, config
@@ -253,6 +297,9 @@ class Runtime:
         self.execution_timeout_sec = execution_timeout_sec
         self.requests, self.output_used = 0, 0
         self.invocations, self.billing = [], []
+        self.codex_retries = []
+        self.provider_circuit_resets = []
+        self.provider_retries = []
         self.worker_errors = []
         self.infrastructure_errors = {}
         self.provider_errors = []
@@ -267,6 +314,17 @@ class Runtime:
         assets=self.run/'runtime-assets';assets.mkdir(exist_ok=True,mode=0o700)
         self.relay=assets/'relay.py'
         shutil.copy2(ROOT/'scripts/h2/relay.py',self.relay)
+        self.model_catalog_asset = None
+        self.model_catalog_sha256 = None
+        catalog_path = config.get("model_catalog_json")
+        if catalog_path:
+            source = Path(catalog_path)
+            if source.is_symlink() or not source.is_file():
+                raise ValueError("Configured model catalog is unavailable or unsafe")
+            self.model_catalog_asset = assets/'model-catalog.json'
+            shutil.copyfile(source, self.model_catalog_asset)
+            os.chmod(self.model_catalog_asset, 0o400)
+            self.model_catalog_sha256 = hashlib.sha256(self.model_catalog_asset.read_bytes()).hexdigest()
         owner = self
         class Proxy(http.server.BaseHTTPRequestHandler):
             def log_message(self,*args): pass
@@ -296,20 +354,28 @@ class Runtime:
                     self.send_response(200); self.send_header("Content-Type", content_type); self.send_header("Content-Length",str(len(payload))); self.end_headers(); self.wfile.write(payload)
                 except ProviderFailure as exc:
                     self.provider_error(exc)
+                except ValueError as exc:
+                    status = 429 if "resource budget exhausted" in str(exc).casefold() else 400
+                    with owner.lock:
+                        owner.infrastructure_errors.setdefault(label,[]).append(str(exc))
+                    event(owner.run,"broker_request_rejected",label=label,local_http_status=status,error=str(exc))
+                    self.send_error(status,"Harness2 local request rejected; see host audit log")
                 except Exception as exc:
                     with owner.lock:
                         owner.infrastructure_errors.setdefault(label,[]).append(str(exc))
-                    event(owner.run, "provider_error", label=label, error=str(exc))
-                    self.send_error(502, "Provider request failed; see host audit log")
+                    event(owner.run, "broker_error", label=label, error=str(exc))
+                    self.send_error(500, "Harness2 local broker failure; see host audit log")
         class UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             daemon_threads = True
         self.proxy_dir = tempfile.TemporaryDirectory(prefix="h2-proxy-")
         self.server = UnixServer(self.proxy_dir.name + "/api.sock", Proxy)
         self.thread = threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
 
-    def _record_provider_failure(self, label, status, request_id=None, retry_after=None, transport=None):
+    def _record_provider_failure(self, label, status, request_id=None, retry_after=None, transport=None, detail=None, transient_code=None):
         opens_circuit = status >= 400 or bool(transport)
-        failure = ProviderFailure(status, self.provider_host, request_id, retry_after, transport=transport)
+        retryable=status in (502,503,504) or transient_code=="upstream_unavailable"
+        failure = ProviderFailure(status, self.provider_host, request_id, retry_after, transport=transport,
+                                  detail=detail,retryable=retryable,transient_code=transient_code)
         record = failure.as_record(label)
         record["circuit_open"] = opens_circuit
         if transport:
@@ -317,7 +383,9 @@ class Runtime:
         with self.lock:
             if opens_circuit and self.provider_circuit is None:
                 self.provider_circuit = {"status": status, "provider_host": self.provider_host,
-                                         "request_id": request_id, "retry_after": retry_after}
+                                         "request_id": request_id, "retry_after": retry_after,
+                                         "retryable":retryable,"transient_code":transient_code,
+                                         "origin_label":label}
             self.provider_errors.append(record)
             self.infrastructure_errors.setdefault(label, []).append(str(failure))
         event(self.run, "provider_error", **record, error=str(failure))
@@ -327,7 +395,8 @@ class Runtime:
     def _reject_open_circuit(self, label, circuit):
         failure = ProviderFailure(circuit["status"], circuit["provider_host"],
                                   circuit.get("request_id"), circuit.get("retry_after"),
-                                  circuit_open=True)
+                                  circuit_open=True,retryable=circuit.get("retryable",False),
+                                  transient_code=circuit.get("transient_code"))
         record = failure.as_record(label)
         record["blocked"] = True
         with self.lock:
@@ -337,13 +406,59 @@ class Runtime:
         atomic(self.run / "cost-ledger.json", self.ledger())
         return failure
 
+    def reset_transient_provider_circuit(self, label, reason):
+        with self.lock:
+            circuit=self.provider_circuit
+            if not circuit or not (circuit.get("status") in (502,503,504) or circuit.get("retryable")):
+                return False
+            self.provider_circuit=None
+            record={"label":label,"status":circuit["status"],
+                    "provider_host":circuit["provider_host"],
+                    "request_id":circuit.get("request_id"),"reason":reason[:1000],
+                    "transient_code":circuit.get("transient_code")}
+            self.provider_circuit_resets.append(record)
+        event(self.run,"provider_circuit_reset",**record)
+        atomic(self.run/"cost-ledger.json",self.ledger())
+        return True
+
+    def _record_provider_retry(self, label, status, request_id, retry_after, *, attempt, transport=None, detail=None, transient_code=None):
+        error = {"label":label,"status":status,"provider_host":self.provider_host,
+                 "request_id":request_id,"retry_after":retry_after,
+                 "circuit_open":False,
+                 "status_origin":"local_transport_mapping" if transport else "provider_http",
+                 "retryable":True,"attempt":attempt,"recovered":False}
+        if transport:
+            error["transport"] = transport
+        if detail:
+            error["detail"] = detail
+        if transient_code:
+            error["transient_code"] = transient_code
+        retry = {"label":label,"status":status,"request_id":request_id,"attempt":attempt,
+                 "retry_after":retry_after,"recovered":False}
+        if transport:
+            retry["transport"] = transport
+        if transient_code:
+            retry["transient_code"] = transient_code
+        with self.lock:
+            self.provider_errors.append(error)
+            self.provider_retries.append(retry)
+        event(self.run,"provider_retry",**retry)
+        atomic(self.run/"cost-ledger.json",self.ledger())
+        return error,retry
+
     def forward(self, label, body, accept):
-        # A single initial request checks provider health; healthy runs retain
-        # bounded parallelism, while an outage blocks queued dispatches.
+        # New independent sessions may probe a transient outage again. The
+        # failed session stays bounded; auth and quota circuits stay closed.
         with self.provider_slots:
             with self.provider_gate:
                 with self.lock:
                     circuit = dict(self.provider_circuit) if self.provider_circuit else None
+                if (circuit and circuit.get("retryable") and circuit.get("origin_label")
+                        and circuit["origin_label"] != label):
+                    self.reset_transient_provider_circuit(
+                        label,"New isolated session after transient failure: " + circuit["origin_label"])
+                    with self.lock:
+                        circuit = dict(self.provider_circuit) if self.provider_circuit else None
                 if circuit:
                     raise self._reject_open_circuit(label, circuit)
                 if not self.provider_ready:
@@ -355,59 +470,124 @@ class Runtime:
     def _dispatch_provider(self, label, body, accept):
         with self.lock:
             circuit = dict(self.provider_circuit) if self.provider_circuit else None
-            if not circuit:
-                if self.cancel.is_set():
-                    raise RuntimeError("Experiment cancelled")
-                reservation = self.budget.reserve(label, len(json.dumps(body).encode()) + 8192)
-                reserve = reservation["output"]
-                self.output_used += reserve
-                self.requests += 1
         if circuit:
             raise self._reject_open_circuit(label, circuit)
-        body = dict(body)
-        body["max_output_tokens"] = reserve
-        body["store"] = False
-        req = urllib.request.Request(
-            self.config["base_url"] + "/responses",
-            data=json.dumps(body).encode(),
-            headers={"Authorization": "Bearer " + self.config["key"],
-                     "Content-Type": "application/json", "Accept": accept},
-        )
-        record = {"at": stamp(), "label": label, "model": self.config["model"],
-                  "model_provider": self.config.get("model_provider"),
-                  "provider_host": self.provider_host, "reserved_output_tokens": reserve}
-        with self.lock:
-            self.billing.append(record)
-        try:
-            with urllib.request.urlopen(req, timeout=180) as response:
-                record["http_status"] = response.status
-                record["provider_request_id"] = _provider_request_id(response.headers)
-                content_type = response.headers.get("Content-Type", "application/json")
-                payload = response.read(32_000_000)
-                record["response_read_complete"] = True
-        except urllib.error.HTTPError as exc:
-            record["http_status"] = exc.code
-            record["provider_request_id"] = _provider_request_id(exc.headers)
-            record["retry_after"] = _retry_after(exc.headers)
-            failure = self._record_provider_failure(
-                label, exc.code, record["provider_request_id"], record["retry_after"])
-            exc.close()
-            raise failure from None
-        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
-            record["transport_error"] = type(exc).__name__
-            failure = self._record_provider_failure(
-                label, 503, transport=type(exc).__name__)
-            raise failure from None
-        usage = extract_usage(payload)
-        record["usage"] = usage
-        self.budget.settle(reservation, usage)
-        event(self.run, "provider_request", **record)
-        atomic(self.run / "cost-ledger.json", self.ledger())
-        return payload, content_type
+        retry_audits=[]
+        for attempt in range(MAX_PROVIDER_RETRIES+1):
+            with self.lock:
+                circuit = dict(self.provider_circuit) if self.provider_circuit else None
+                if not circuit:
+                    if self.cancel.is_set():
+                        raise RuntimeError("Experiment cancelled")
+                    reservation = self.budget.reserve(label, len(json.dumps(body).encode()) + 8192)
+                    reserve = reservation["output"]
+                    self.output_used += reserve
+                    self.requests += 1
+            if circuit:
+                raise self._reject_open_circuit(label, circuit)
+            attempt_body = dict(body)
+            attempt_body["max_output_tokens"] = reserve
+            attempt_body["store"] = False
+            req = urllib.request.Request(
+                self.config["base_url"] + "/responses",
+                data=json.dumps(attempt_body).encode(),
+                headers={"Authorization": "Bearer " + self.config["key"],
+                         "Content-Type": "application/json", "Accept": accept},
+            )
+            record = {"at": stamp(), "label":label, "model":self.config["model"],
+                      "model_provider":self.config.get("model_provider"),
+                      "provider_host":self.provider_host, "reserved_output_tokens":reserve,
+                      "reserved_total_tokens":reservation["tokens"],
+                      "request_bytes":len(req.data),
+                      "attempt":attempt+1}
+            with self.lock:
+                self.billing.append(record)
+            try:
+                with urllib.request.urlopen(req, timeout=180) as response:
+                    record["http_status"] = response.status
+                    record["provider_request_id"] = _provider_request_id(response.headers)
+                    content_type = response.headers.get("Content-Type", "application/json")
+                    payload = response.read(32_000_000)
+                    record["response_read_complete"] = True
+            except urllib.error.HTTPError as exc:
+                record["http_status"] = exc.code
+                record["provider_request_id"] = _provider_request_id(exc.headers)
+                record["retry_after"] = _retry_after(exc.headers)
+                detail,provider_code=_provider_error_detail(exc,self.config["key"])
+                if detail:
+                    record["provider_error_detail"] = detail
+                transient_code=provider_code if provider_code=="upstream_unavailable" else None
+                retryable=exc.code in (502,503,504) or transient_code is not None
+                if attempt < MAX_PROVIDER_RETRIES and retryable:
+                    error_record,retry_audit=self._record_provider_retry(
+                        label,exc.code,record["provider_request_id"],record["retry_after"],
+                        attempt=attempt+1,detail=detail,transient_code=transient_code)
+                    retry_audits.append((error_record,retry_audit))
+                    event(self.run,"provider_request",**record)
+                    exc.close()
+                    delay=int(record["retry_after"] or str(2**attempt))
+                    if self.cancel.wait(min(delay,30)):
+                        raise RuntimeError("Experiment cancelled during provider retry")
+                    continue
+                failure = self._record_provider_failure(
+                    label, exc.code, record["provider_request_id"], record["retry_after"],
+                    detail=detail,transient_code=transient_code)
+                exc.close()
+                raise failure from None
+            except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
+                record["transport_error"] = type(exc).__name__
+                if attempt == 0 and isinstance(exc, http.client.IncompleteRead):
+                    error_record,retry_audit=self._record_provider_retry(
+                        label,None,record.get("provider_request_id"),None,attempt=attempt+1,
+                        transport=type(exc).__name__)
+                    retry_audits.append((error_record,retry_audit))
+                    event(self.run,"provider_request",**record)
+                    if self.cancel.wait(1):
+                        raise RuntimeError("Experiment cancelled during provider stream retry")
+                    continue
+                failure = self._record_provider_failure(
+                    label, 503, transport=type(exc).__name__)
+                raise failure from None
+            if retry_audits:
+                with self.lock:
+                    for error_record,retry_audit in retry_audits:
+                        retry_audit["recovered"] = True
+                        error_record["recovered"] = True
+                for _,retry_audit in retry_audits:
+                    event(self.run,"provider_retry_recovered",**dict(retry_audit))
+            usage = extract_usage(payload)
+            record["usage"] = usage
+            try:
+                adjustment = self.budget.settle(reservation, usage)
+                if adjustment:
+                    record["usage_adjustment"] = adjustment
+            except ValueError as exc:
+                record["usage_accounting_error"] = str(exc)
+                raise
+            finally:
+                event(self.run, "provider_request", **record)
+                atomic(self.run / "cost-ledger.json", self.ledger())
+            return payload, content_type
+        raise RuntimeError("Provider retry loop ended unexpectedly")
 
     def close(self):
         self.server.shutdown();self.server.server_close();self.thread.join(timeout=2)
         self.proxy_dir.cleanup()
+
+    def record_codex_retry(self, failed_label, retry_label, reason, *, recovered, resolved_label=None):
+        record = {"failed_label":failed_label,"retry_label":retry_label,
+                  "reason":reason[:1000],"recovered":bool(recovered),
+                  "resolved_label":resolved_label if recovered else None}
+        with self.lock:
+            self.codex_retries.append(record)
+            if recovered:
+                for invocation in self.invocations:
+                    if invocation.get("label") == failed_label:
+                        invocation["recovered_by"] = resolved_label or retry_label
+                        atomic(self.run/'invocations'/(failed_label+'.json'), invocation)
+                        break
+        event(self.run,"codex_invocation_retry",**record)
+        return record
 
     def call(self, work, mission, label, *, strategy=None, tools=None, readonly=False):
         if self.cancel.is_set(): raise RuntimeError("Experiment cancelled")
@@ -425,17 +605,21 @@ class Runtime:
         approval = self.config["approval_policy"]
         config = (
             "model = " + json.dumps(self.config["model"]) + "\nmodel_provider = \"h2proxy\"\n"
-            "sandbox_mode = " + json.dumps(sandbox) + "\napproval_policy = " + json.dumps(approval) + "\n"
-            "default_permissions = " + json.dumps(":read-only" if sandbox == "read-only" else ":workspace") + "\n"
-            "model_reasoning_effort = " + json.dumps(strategy["reasoning_effort"]) + "\nweb_search = \"disabled\"\n"
-            "[features]\nshell_tool = " + str(tools["shell"]).lower() + "\napply_patch_freeform = " + str(tools["apply_patch"]).lower() + "\nmulti_agent = false\nhooks = false\napps = false\n"
-            "[model_providers.h2proxy]\nname = \"Harness2 credential proxy\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\nbase_url = \"http://127.0.0.1:17280\"\n"
+            + ("model_catalog_json = \"/home/worker/model-catalog.json\"\n" if self.model_catalog_asset else "")
+            + "sandbox_mode = " + json.dumps(sandbox) + "\napproval_policy = " + json.dumps(approval) + "\n"
+            + "default_permissions = " + json.dumps(":read-only" if sandbox == "read-only" else ":workspace") + "\n"
+            + "model_reasoning_effort = " + json.dumps(strategy["reasoning_effort"]) + "\nweb_search = \"disabled\"\n"
+            + "[features]\nshell_tool = " + str(tools["shell"]).lower() + "\napply_patch_freeform = " + str(tools["apply_patch"]).lower() + "\nmulti_agent = false\nhooks = false\napps = false\n"
+            + "[model_providers.h2proxy]\nname = \"Harness2 credential proxy\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\nbase_url = \"http://127.0.0.1:17280\"\n"
         )
         (home / "config.toml").write_text(config)
         (home / "auth.json").write_text(json.dumps({"OPENAI_API_KEY":token}))
         rules=Path(self.config.get("codex_home","/nonexistent"))/"rules"
         if rules.is_dir():shutil.copytree(rules,home/"rules",ignore=shutil.ignore_patterns("*.pyc","__pycache__"))
         mounts=[(self.binary,"/codex"),(self.relay,"/relay.py"),(Path(self.proxy_dir.name),"/broker"),(home/"config.toml","/home/worker/config.toml"),(home/"auth.json","/home/worker/auth.json")]
+        if self.model_catalog_asset:
+            (home/"model-catalog.json").touch(mode=0o400)
+            mounts.append((self.model_catalog_asset,"/home/worker/model-catalog.json"))
         if (home/"rules").is_dir():mounts.append((home/"rules","/home/worker/rules"))
         if (work/".codex/rules").is_dir():mounts.append((work/".codex/rules","/work/.codex/rules"))
         cmd = guard.prefix(work, home, read_only=sandbox=="read-only", mounts=mounts)
@@ -480,10 +664,13 @@ class Runtime:
         with self.lock:
             billing = list(self.billing)
             provider_errors = [dict(x) for x in self.provider_errors]
+            provider_retries = [dict(item) for item in self.provider_retries]
             invocation_count = len(self.invocations)
             provider_requests = self.requests
             output_reserved = self.output_used
             worker_errors = [dict(x) for x in self.worker_errors]
+            codex_retries = [dict(item) for item in self.codex_retries]
+            provider_circuit_resets = [dict(item) for item in self.provider_circuit_resets]
         known = [x["usage"] for x in billing if x.get("usage")]
         totals = {key:sum(int(x.get(key,0)) for x in known) for key in ("input_tokens","output_tokens","total_tokens")}
         totals["cached_input_tokens"] = sum(int(x.get("input_tokens_details",{}).get("cached_tokens",0)) for x in known)
@@ -491,10 +678,15 @@ class Runtime:
         totals["responses_with_usage"] = len(known)
         totals["provider_responses_missing_usage"] = max(0, provider_requests-len(known))
         totals["provider_errors"] = provider_errors
+        totals["provider_retries"] = provider_retries
         totals["codex_worker_errors"] = worker_errors
         if self.prices and len(known)==provider_requests:
             totals["cost_usd"] = (totals["input_tokens"]*self.prices["input_per_million"]+totals["output_tokens"]*self.prices["output_per_million"])/1e6
             totals["cost_status"] = "estimate using user-supplied rates; not an invoice"
         totals["invocations"] = invocation_count
+        totals["codex_retries"] = codex_retries
+        totals["provider_circuit_resets"] = provider_circuit_resets
+        totals["model_catalog"] = ({"sha256":self.model_catalog_sha256,"mounted_read_only":True}
+                                   if self.model_catalog_asset else {"configured":False})
         totals['resource_envelopes'] = self.budget.ledger()
         return totals
